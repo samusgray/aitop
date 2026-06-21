@@ -564,10 +564,10 @@ fn render_skyline(frame: &mut Frame<'_>, skyline: &ActivitySkyline, area: Rect) 
     frame.render_widget(
         Paragraph::new(rows).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::styled(" activity skyline ", title_style()),
-                    Span::styled("recent ambient agent activity ", dim()),
-                ]))
+                .title(Line::from(vec![Span::styled(
+                    " agent activity ",
+                    title_style(),
+                )]))
                 .borders(Borders::ALL),
         ),
         area,
