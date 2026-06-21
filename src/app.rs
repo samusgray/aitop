@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::{
     codex,
     git::status_for_cwd,
-    model::{AgentKind, AgentSession, SessionStatus},
+    model::{AgentKind, AgentSession, GitStatus, SessionStatus},
     process::ProcessSampler,
     sources::claude,
 };
@@ -17,6 +17,28 @@ pub struct AmbientSnapshot {
     pub activity: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFilter {
+    Active,
+    All,
+}
+
+impl SessionFilter {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Active => Self::All,
+            Self::All => Self::Active,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::All => "all",
+        }
+    }
+}
+
 impl AmbientSnapshot {
     pub fn active_count(&self) -> usize {
         self.sessions
@@ -26,10 +48,11 @@ impl AmbientSnapshot {
     }
 
     pub fn text_summary(&self) -> String {
-        if self.sessions.is_empty() {
-            return "aitop: no ambient agent sessions found".to_string();
+        let sessions = visible_sessions(&self.sessions, SessionFilter::Active);
+        if sessions.is_empty() {
+            return "aitop: no active ambient agent sessions found".to_string();
         }
-        self.sessions
+        sessions
             .iter()
             .map(|session| {
                 format!(
@@ -51,6 +74,55 @@ impl AmbientSnapshot {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+pub fn visible_sessions(sessions: &[AgentSession], filter: SessionFilter) -> Vec<AgentSession> {
+    let mut visible = Vec::new();
+    let mut recent_by_project: BTreeMap<(AgentKind, String), AgentSession> = BTreeMap::new();
+
+    for session in sessions {
+        if session.status == SessionStatus::Running {
+            visible.push(session.clone());
+            continue;
+        }
+
+        if filter == SessionFilter::All {
+            let key = (session.agent, project_key(session));
+            match recent_by_project.get_mut(&key) {
+                Some(existing) if session.updated_at > existing.updated_at => {
+                    *existing = session.clone();
+                }
+                None => {
+                    recent_by_project.insert(key, session.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if filter == SessionFilter::All {
+        visible.extend(recent_by_project.into_values());
+    }
+
+    visible.sort_by(|a, b| {
+        b.status
+            .eq(&SessionStatus::Running)
+            .cmp(&a.status.eq(&SessionStatus::Running))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    visible
+}
+
+fn project_key(session: &AgentSession) -> String {
+    session
+        .git
+        .as_ref()
+        .map(git_root_key)
+        .unwrap_or_else(|| session.cwd.display().to_string())
+}
+
+fn git_root_key(git: &GitStatus) -> String {
+    git.root.display().to_string()
 }
 
 pub fn snapshot() -> Result<AmbientSnapshot> {

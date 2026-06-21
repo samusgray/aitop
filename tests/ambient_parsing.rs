@@ -1,7 +1,10 @@
 use std::{fs, path::Path};
 
 use aitop::{
-    app::{merge_sessions, policy_for_missing_processes},
+    app::{
+        AmbientSnapshot, SessionFilter, merge_sessions, policy_for_missing_processes,
+        visible_sessions,
+    },
     codex::{read_process_manager, read_threads_from_db},
     git::project_name,
     model::{AgentKind, AgentSession, SessionStatus},
@@ -305,4 +308,101 @@ fn missing_claude_process_demotes_running_session_to_recent() {
     policy_for_missing_processes(&mut sessions);
 
     assert_eq!(sessions[0].status, SessionStatus::Recent);
+}
+
+#[test]
+fn visible_sessions_defaults_to_running_sessions_only() {
+    let running = test_session("live", SessionStatus::Running, "/Users/sg/code/live", 10);
+    let recent = test_session("recent", SessionStatus::Recent, "/Users/sg/code/recent", 20);
+
+    let visible = visible_sessions(&[recent, running], SessionFilter::Active);
+
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].native_id.as_deref(), Some("live"));
+    assert_eq!(visible[0].status, SessionStatus::Running);
+}
+
+#[test]
+fn text_summary_uses_active_only_default() {
+    let running = test_session("live", SessionStatus::Running, "/Users/sg/code/live", 10);
+    let recent = test_session("recent", SessionStatus::Recent, "/Users/sg/code/recent", 20);
+    let snapshot = AmbientSnapshot {
+        sessions: vec![recent, running],
+        generated_at: std::time::SystemTime::UNIX_EPOCH,
+        activity: vec![],
+    };
+
+    let summary = snapshot.text_summary();
+
+    assert!(summary.contains("live"));
+    assert!(!summary.contains("recent"));
+}
+
+#[test]
+fn all_sessions_dedupes_inactive_rows_by_project() {
+    let older = test_session(
+        "older",
+        SessionStatus::Recent,
+        "/Users/sg/Documents/New project",
+        10,
+    );
+    let newer = test_session(
+        "newer",
+        SessionStatus::Recent,
+        "/Users/sg/Documents/New project",
+        20,
+    );
+    let other = test_session("other", SessionStatus::Recent, "/Users/sg/code/aitop", 15);
+    let running = test_session(
+        "live",
+        SessionStatus::Running,
+        "/Users/sg/Documents/New project",
+        5,
+    );
+
+    let visible = visible_sessions(&[older, newer, other, running], SessionFilter::All);
+
+    assert_eq!(visible.len(), 3);
+    assert_eq!(visible[0].native_id.as_deref(), Some("live"));
+    assert!(
+        visible
+            .iter()
+            .any(|session| session.native_id.as_deref() == Some("newer"))
+    );
+    assert!(
+        !visible
+            .iter()
+            .any(|session| session.native_id.as_deref() == Some("older"))
+    );
+    assert!(
+        visible
+            .iter()
+            .any(|session| session.native_id.as_deref() == Some("other"))
+    );
+}
+
+fn test_session(id: &str, status: SessionStatus, cwd: &str, updated_at: u64) -> AgentSession {
+    AgentSession {
+        agent: AgentKind::Codex,
+        native_id: Some(id.to_string()),
+        title: None,
+        command: Some("codex".to_string()),
+        cwd: cwd.into(),
+        pid: if status == SessionStatus::Running {
+            Some(123)
+        } else {
+            None
+        },
+        status,
+        started_at: None,
+        updated_at: Some(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(updated_at),
+        ),
+        model: None,
+        tokens_total: None,
+        git_branch: None,
+        journal_path: None,
+        process: None,
+        git: None,
+    }
 }

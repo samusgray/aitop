@@ -40,7 +40,7 @@ AITOP_INSTALL_DIR=/some/bin ./scripts/install.sh
 
 ## Usage
 
-Open the dashboard:
+Open the dashboard. By default, the session list shows active sessions only:
 
 ```bash
 aitop
@@ -56,6 +56,7 @@ Monitor controls:
 
 - `up`/`down` or `j`/`k`: select a session
 - `enter`: open the focused tail view
+- `a`: toggle active-only and all sessions
 - `r`: refresh
 - `q`: quit
 
@@ -64,6 +65,7 @@ Tail controls:
 - `up`/`down` or `j`/`k`: scroll
 - `g` / `G`: jump toward top or bottom
 - `esc`: return to monitor
+- `a`: return to monitor and toggle active-only/all sessions
 - `q`: quit
 
 Future idea: an ask-style footer REPL for questions about visible sessions, processes, git state, and recent events.

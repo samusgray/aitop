@@ -1,4 +1,7 @@
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use crossterm::{
@@ -13,18 +16,19 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
 use crate::{
-    app::{AmbientSnapshot, format_bytes, snapshot_with_sampler},
+    app::{AmbientSnapshot, SessionFilter, format_bytes, snapshot_with_sampler, visible_sessions},
     feed::{FeedEvent, FeedRecord, SessionFeed, annotation_summary, load_session_feed},
     model::{AgentSession, SessionStatus, elapsed_label, path_home_display, time_label},
     pricing::{compact_tokens, short_model},
     process::ProcessSampler,
 };
 
-const TICK: Duration = Duration::from_millis(1000);
+const INPUT_TICK: Duration = Duration::from_millis(75);
+const REFRESH_TICK: Duration = Duration::from_millis(1000);
 
 enum ViewMode {
     Monitor,
@@ -46,24 +50,31 @@ pub fn run() -> Result<()> {
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut selected = 0usize;
     let mut mode = ViewMode::Monitor;
+    let mut filter = SessionFilter::Active;
     let mut sampler = ProcessSampler::new();
+    let mut snapshot = snapshot_with_sampler(&mut sampler)?;
+    let mut last_refresh = Instant::now();
 
     loop {
-        let snapshot = snapshot_with_sampler(&mut sampler)?;
-        selected = clamp_selected(selected, snapshot.sessions.len());
-        terminal.draw(|frame| draw(frame, &snapshot, selected, &mode))?;
+        let sessions = visible_sessions(&snapshot.sessions, filter);
+        selected = clamp_selected(selected, sessions.len());
+        terminal.draw(|frame| draw(frame, &snapshot, &sessions, selected, &mode, filter))?;
 
-        if !event::poll(TICK)? {
-            continue;
-        }
-        if let Event::Key(key) = event::read()? {
+        if event::poll(INPUT_TICK)?
+            && let Event::Key(key) = event::read()?
+        {
             match (&mut mode, key.code) {
                 (_, KeyCode::Char('q')) => return Ok(()),
                 (ViewMode::Tail { .. }, KeyCode::Esc) => mode = ViewMode::Monitor,
                 (ViewMode::Monitor, KeyCode::Esc) => return Ok(()),
+                (_, KeyCode::Char('a')) => {
+                    filter = filter.toggle();
+                    selected = 0;
+                    mode = ViewMode::Monitor;
+                }
                 (ViewMode::Monitor, KeyCode::Enter) => mode = ViewMode::Tail { scroll: 0 },
                 (ViewMode::Monitor, KeyCode::Down | KeyCode::Char('j')) => {
-                    selected = (selected + 1).min(snapshot.sessions.len().saturating_sub(1));
+                    selected = (selected + 1).min(sessions.len().saturating_sub(1));
                 }
                 (ViewMode::Monitor, KeyCode::Up | KeyCode::Char('k')) => {
                     selected = selected.saturating_sub(1);
@@ -76,23 +87,44 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
                 }
                 (ViewMode::Tail { scroll }, KeyCode::Char('g')) => *scroll = 0,
                 (ViewMode::Tail { scroll }, KeyCode::Char('G')) => *scroll = usize::MAX,
-                (_, KeyCode::Char('r')) => {}
+                (_, KeyCode::Char('r')) => {
+                    snapshot = snapshot_with_sampler(&mut sampler)?;
+                    last_refresh = Instant::now();
+                }
                 _ => {}
             }
+        }
+
+        if last_refresh.elapsed() >= REFRESH_TICK {
+            snapshot = snapshot_with_sampler(&mut sampler)?;
+            last_refresh = Instant::now();
         }
     }
 }
 
-fn draw(frame: &mut Frame<'_>, snapshot: &AmbientSnapshot, selected: usize, mode: &ViewMode) {
+fn draw(
+    frame: &mut Frame<'_>,
+    snapshot: &AmbientSnapshot,
+    sessions: &[AgentSession],
+    selected: usize,
+    mode: &ViewMode,
+    filter: SessionFilter,
+) {
     let area = frame.area();
     frame.render_widget(Clear, area);
     match mode {
-        ViewMode::Monitor => draw_monitor(frame, snapshot, selected),
-        ViewMode::Tail { scroll } => draw_tail(frame, snapshot, selected, *scroll),
+        ViewMode::Monitor => draw_monitor(frame, snapshot, sessions, selected, filter),
+        ViewMode::Tail { scroll } => draw_tail(frame, sessions, selected, *scroll, filter),
     }
 }
 
-fn draw_monitor(frame: &mut Frame<'_>, snapshot: &AmbientSnapshot, selected: usize) {
+fn draw_monitor(
+    frame: &mut Frame<'_>,
+    snapshot: &AmbientSnapshot,
+    sessions: &[AgentSession],
+    selected: usize,
+    filter: SessionFilter,
+) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -103,24 +135,28 @@ fn draw_monitor(frame: &mut Frame<'_>, snapshot: &AmbientSnapshot, selected: usi
         ])
         .split(frame.area());
 
-    frame.render_widget(header(snapshot), vertical[0]);
+    frame.render_widget(Clear, vertical[0]);
+    frame.render_widget(header(snapshot, filter), vertical[0]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(61), Constraint::Percentage(39)])
         .split(vertical[1]);
 
-    frame.render_widget(session_table(snapshot, selected), main[0]);
-    frame.render_widget(session_detail(snapshot.sessions.get(selected)), main[1]);
-    frame.render_widget(activity(snapshot), vertical[2]);
+    frame.render_widget(Clear, main[0]);
+    frame.render_widget(session_table(snapshot, sessions, selected, filter), main[0]);
+    frame.render_widget(Clear, main[1]);
+    frame.render_widget(session_detail(sessions.get(selected)), main[1]);
+    render_activity(frame, snapshot, vertical[2]);
+    frame.render_widget(Clear, vertical[3]);
     frame.render_widget(monitor_footer(), vertical[3]);
 
-    if snapshot.sessions.is_empty() {
+    if sessions.is_empty() {
         draw_empty_state(frame, main[0]);
     }
 }
 
-fn header(snapshot: &AmbientSnapshot) -> Paragraph<'static> {
+fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'static> {
     let status = if snapshot.active_count() == 0 {
         "idle".to_string()
     } else {
@@ -143,13 +179,20 @@ fn header(snapshot: &AmbientSnapshot) -> Paragraph<'static> {
         Span::raw("  "),
         Span::styled(status, Style::default().fg(Color::Gray)),
         Span::raw("  "),
+        Span::styled(format!("filter: {} ", filter.label()), dim()),
+        Span::raw("  "),
         Span::styled("live ", Style::default().fg(Color::Green)),
         Span::styled(time_label(Some(snapshot.generated_at)), strong()),
     ]))
     .block(Block::default().borders(Borders::BOTTOM))
 }
 
-fn session_table(snapshot: &AmbientSnapshot, selected: usize) -> List<'static> {
+fn session_table(
+    snapshot: &AmbientSnapshot,
+    sessions: &[AgentSession],
+    selected: usize,
+    filter: SessionFilter,
+) -> List<'static> {
     let mut rows = vec![ListItem::new(Line::from(vec![
         Span::styled("  AGENT     ", dim()),
         Span::styled("REPO        ", dim()),
@@ -160,7 +203,7 @@ fn session_table(snapshot: &AmbientSnapshot, selected: usize) -> List<'static> {
         Span::styled("TOK", dim()),
     ]))];
 
-    for (index, session) in snapshot.sessions.iter().enumerate() {
+    for (index, session) in sessions.iter().enumerate() {
         let style = if index == selected {
             Style::default().bg(Color::Rgb(16, 48, 32)).fg(Color::White)
         } else {
@@ -181,6 +224,7 @@ fn session_table(snapshot: &AmbientSnapshot, selected: usize) -> List<'static> {
                     ),
                     dim(),
                 ),
+                Span::styled(format!("{} view ", filter.label()), dim()),
             ]))
             .borders(Borders::ALL),
     )
@@ -333,14 +377,22 @@ fn session_detail(session: Option<&AgentSession>) -> Paragraph<'static> {
     )
 }
 
-fn activity(snapshot: &AmbientSnapshot) -> Paragraph<'static> {
+fn render_activity(frame: &mut Frame<'_>, snapshot: &AmbientSnapshot, area: Rect) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        activity(snapshot, area.width.saturating_sub(4) as usize),
+        area,
+    );
+}
+
+fn activity(snapshot: &AmbientSnapshot, width: usize) -> Paragraph<'static> {
     let lines = if snapshot.activity.is_empty() {
         vec![Line::from(" -   watch   native Claude/Codex activity")]
     } else {
         snapshot
             .activity
             .iter()
-            .map(|line| Line::from(line.clone()))
+            .map(|line| Line::from(truncate(line, width)))
             .collect()
     };
     Paragraph::new(lines).block(
@@ -361,6 +413,8 @@ fn monitor_footer() -> Paragraph<'static> {
         Span::raw(" tail   "),
         Span::styled("r", key_style()),
         Span::raw(" refresh   "),
+        Span::styled("a", key_style()),
+        Span::raw(" all/active   "),
         Span::styled("q", key_style()),
         Span::raw(" quit   "),
         Span::styled("future", dim()),
@@ -369,7 +423,13 @@ fn monitor_footer() -> Paragraph<'static> {
     .block(Block::default().borders(Borders::TOP))
 }
 
-fn draw_tail(frame: &mut Frame<'_>, snapshot: &AmbientSnapshot, selected: usize, scroll: usize) {
+fn draw_tail(
+    frame: &mut Frame<'_>,
+    sessions: &[AgentSession],
+    selected: usize,
+    scroll: usize,
+    filter: SessionFilter,
+) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(12), Constraint::Length(2)])
@@ -379,19 +439,38 @@ fn draw_tail(frame: &mut Frame<'_>, snapshot: &AmbientSnapshot, selected: usize,
         .constraints([Constraint::Length(36), Constraint::Min(40)])
         .split(vertical[0]);
 
-    frame.render_widget(tail_sidebar(snapshot, selected), body[0]);
-    let selected_session = snapshot.sessions.get(selected);
+    frame.render_widget(Clear, body[0]);
+    frame.render_widget(tail_sidebar(sessions, selected, filter), body[0]);
+    let selected_session = sessions.get(selected);
     let feed = selected_session.and_then(load_feed_for_session);
-    frame.render_widget(tail_feed(selected_session, feed.as_ref(), scroll), body[1]);
+    frame.render_widget(Clear, body[1]);
+    frame.render_widget(
+        tail_feed(
+            selected_session,
+            feed.as_ref(),
+            scroll,
+            body[1].width.saturating_sub(4) as usize,
+        ),
+        body[1],
+    );
+    frame.render_widget(Clear, vertical[1]);
     frame.render_widget(tail_footer(feed.as_ref()), vertical[1]);
 }
 
-fn tail_sidebar(snapshot: &AmbientSnapshot, selected: usize) -> Paragraph<'static> {
+fn tail_sidebar(
+    sessions: &[AgentSession],
+    selected: usize,
+    filter: SessionFilter,
+) -> Paragraph<'static> {
     let mut lines = vec![Line::from(Span::styled(
-        format!("SESSIONS - {} SESSIONS", snapshot.sessions.len()),
+        format!(
+            "SESSIONS - {} {}",
+            sessions.len(),
+            filter.label().to_uppercase()
+        ),
         dim(),
     ))];
-    for (index, session) in snapshot.sessions.iter().enumerate() {
+    for (index, session) in sessions.iter().enumerate() {
         let selected_row = index == selected;
         let live = session.status == SessionStatus::Running;
         let prefix = if selected_row { "|" } else { " " };
@@ -439,6 +518,7 @@ fn tail_feed(
     session: Option<&AgentSession>,
     feed: Option<&SessionFeed>,
     scroll: usize,
+    width: usize,
 ) -> Paragraph<'static> {
     let title = session
         .map(|session| {
@@ -466,7 +546,7 @@ fn tail_feed(
         }
         (Some(_), Some(feed)) => {
             for record in &feed.records {
-                lines.extend(feed_record_lines(record));
+                lines.extend(feed_record_lines(record, width));
             }
         }
         (Some(session), None) => {
@@ -492,10 +572,9 @@ fn tail_feed(
                 .border_style(Style::default().fg(Color::Green)),
         )
         .scroll((scroll as u16, 0))
-        .wrap(Wrap { trim: false })
 }
 
-fn feed_record_lines(record: &FeedRecord) -> Vec<Line<'static>> {
+fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
     let badge = annotation_summary(&record.annotations);
     let badge = if badge.is_empty() {
         Vec::new()
@@ -509,20 +588,23 @@ fn feed_record_lines(record: &FeedRecord) -> Vec<Line<'static>> {
         FeedEvent::User { text } => {
             let mut spans = vec![
                 Span::styled("> you ", Style::default().fg(Color::Cyan)),
-                Span::raw(text.clone()),
+                Span::raw(truncate(text, width.saturating_sub(6))),
             ];
             spans.extend(badge);
             vec![Line::from(spans)]
         }
         FeedEvent::Assistant { text, .. } => {
             let mut lines = vec![Line::from(vec![Span::styled("* assistant", accent())])];
-            lines.push(Line::from(format!("  {}", text)));
+            lines.push(Line::from(format!(
+                "  {}",
+                truncate(text, width.saturating_sub(2))
+            )));
             lines
         }
         FeedEvent::Thinking { text } => vec![Line::from(vec![
             Span::styled("~ thinking ", dim()),
             Span::styled(
-                text.clone(),
+                truncate(text, width.saturating_sub(11)),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -538,7 +620,10 @@ fn feed_record_lines(record: &FeedRecord) -> Vec<Line<'static>> {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(summary.clone(), dim()),
+                Span::styled(
+                    truncate(summary, width.saturating_sub(name.len() + 4)),
+                    dim(),
+                ),
             ];
             spans.extend(badge);
             vec![Line::from(spans)]
@@ -553,7 +638,7 @@ fn feed_record_lines(record: &FeedRecord) -> Vec<Line<'static>> {
             for line in detail.lines().take(10) {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(line.to_string(), style),
+                    Span::styled(truncate(line, width.saturating_sub(2)), style),
                 ]));
             }
             lines
@@ -588,9 +673,10 @@ fn tail_footer(feed: Option<&SessionFeed>) -> Paragraph<'static> {
         Span::raw(" scroll   "),
         Span::styled("esc", key_style()),
         Span::raw(" monitor   "),
+        Span::styled("a", key_style()),
+        Span::raw(" all/active   "),
         Span::styled("q", key_style()),
-        Span::raw(" quit"),
-        Span::raw(format!("{:>48}", "")),
+        Span::raw(" quit   "),
         Span::styled(
             format!("tokens in {input} out {output} ctx {ctx} {cost}"),
             Style::default().fg(Color::Green),
