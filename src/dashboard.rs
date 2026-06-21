@@ -73,7 +73,6 @@ impl ActivitySample {
         Self { score, tone }
     }
 
-    #[cfg(test)]
     fn quiet() -> Self {
         Self::new(0, ActivityTone::Quiet)
     }
@@ -135,6 +134,11 @@ impl ActivityScorer {
             .iter()
             .map(|session| (session_key(session), observe_session(session)))
             .collect::<BTreeMap<_, _>>();
+        if self.previous.is_empty() {
+            self.previous = current;
+            return ActivitySample::quiet();
+        }
+
         let mut score = 0;
         let mut hot = false;
 
@@ -1406,7 +1410,7 @@ mod tests {
         let quiet = scorer.score(&unchanged);
         let active = scorer.score(&changed);
 
-        assert!(warmup.score > 0);
+        assert_eq!(warmup, ActivitySample::quiet());
         assert_eq!(quiet.score, 0);
         assert!(active.score > quiet.score);
         assert!(matches!(
