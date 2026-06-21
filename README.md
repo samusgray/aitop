@@ -62,7 +62,8 @@ Monitor controls:
 
 Tail controls:
 
-- `up`/`down` or `j`/`k`: scroll
+- `up`/`down` or `j`/`k`: select a session
+- `page up` / `page down`: scroll the focused session feed
 - `g` / `G`: jump toward top or bottom
 - `esc`: return to monitor
 - `a`: return to monitor and toggle active-only/all sessions

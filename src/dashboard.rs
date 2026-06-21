@@ -35,6 +35,12 @@ enum ViewMode {
     Tail { scroll: usize },
 }
 
+enum KeyAction {
+    Continue,
+    Refresh,
+    Quit,
+}
+
 pub fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -63,35 +69,19 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
         if event::poll(INPUT_TICK)?
             && let Event::Key(key) = event::read()?
         {
-            match (&mut mode, key.code) {
-                (_, KeyCode::Char('q')) => return Ok(()),
-                (ViewMode::Tail { .. }, KeyCode::Esc) => mode = ViewMode::Monitor,
-                (ViewMode::Monitor, KeyCode::Esc) => return Ok(()),
-                (_, KeyCode::Char('a')) => {
-                    filter = filter.toggle();
-                    selected = 0;
-                    mode = ViewMode::Monitor;
-                }
-                (ViewMode::Monitor, KeyCode::Enter) => mode = ViewMode::Tail { scroll: 0 },
-                (ViewMode::Monitor, KeyCode::Down | KeyCode::Char('j')) => {
-                    selected = (selected + 1).min(sessions.len().saturating_sub(1));
-                }
-                (ViewMode::Monitor, KeyCode::Up | KeyCode::Char('k')) => {
-                    selected = selected.saturating_sub(1);
-                }
-                (ViewMode::Tail { scroll }, KeyCode::Down | KeyCode::Char('j')) => {
-                    *scroll = scroll.saturating_add(1);
-                }
-                (ViewMode::Tail { scroll }, KeyCode::Up | KeyCode::Char('k')) => {
-                    *scroll = scroll.saturating_sub(1);
-                }
-                (ViewMode::Tail { scroll }, KeyCode::Char('g')) => *scroll = 0,
-                (ViewMode::Tail { scroll }, KeyCode::Char('G')) => *scroll = usize::MAX,
-                (_, KeyCode::Char('r')) => {
+            match handle_key(
+                &mut mode,
+                &mut selected,
+                &mut filter,
+                sessions.len(),
+                key.code,
+            ) {
+                KeyAction::Quit => return Ok(()),
+                KeyAction::Refresh => {
                     snapshot = snapshot_with_sampler(&mut sampler)?;
                     last_refresh = Instant::now();
                 }
-                _ => {}
+                KeyAction::Continue => {}
             }
         }
 
@@ -99,6 +89,75 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
             snapshot = snapshot_with_sampler(&mut sampler)?;
             last_refresh = Instant::now();
         }
+    }
+}
+
+fn handle_key(
+    mode: &mut ViewMode,
+    selected: &mut usize,
+    filter: &mut SessionFilter,
+    session_count: usize,
+    key: KeyCode,
+) -> KeyAction {
+    match key {
+        KeyCode::Char('q') => KeyAction::Quit,
+        KeyCode::Esc => match mode {
+            ViewMode::Tail { .. } => {
+                *mode = ViewMode::Monitor;
+                KeyAction::Continue
+            }
+            ViewMode::Monitor => KeyAction::Quit,
+        },
+        KeyCode::Char('a') => {
+            *filter = filter.toggle();
+            *selected = 0;
+            *mode = ViewMode::Monitor;
+            KeyAction::Continue
+        }
+        KeyCode::Enter if matches!(mode, ViewMode::Monitor) => {
+            *mode = ViewMode::Tail { scroll: 0 };
+            KeyAction::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            *selected = (*selected + 1).min(session_count.saturating_sub(1));
+            if let ViewMode::Tail { scroll } = mode {
+                *scroll = 0;
+            }
+            KeyAction::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *selected = selected.saturating_sub(1);
+            if let ViewMode::Tail { scroll } = mode {
+                *scroll = 0;
+            }
+            KeyAction::Continue
+        }
+        KeyCode::PageDown => {
+            if let ViewMode::Tail { scroll } = mode {
+                *scroll = scroll.saturating_add(5);
+            }
+            KeyAction::Continue
+        }
+        KeyCode::PageUp => {
+            if let ViewMode::Tail { scroll } = mode {
+                *scroll = scroll.saturating_sub(5);
+            }
+            KeyAction::Continue
+        }
+        KeyCode::Char('g') => {
+            if let ViewMode::Tail { scroll } = mode {
+                *scroll = 0;
+            }
+            KeyAction::Continue
+        }
+        KeyCode::Char('G') => {
+            if let ViewMode::Tail { scroll } = mode {
+                *scroll = usize::MAX;
+            }
+            KeyAction::Continue
+        }
+        KeyCode::Char('r') => KeyAction::Refresh,
+        _ => KeyAction::Continue,
     }
 }
 
@@ -550,8 +609,7 @@ fn tail_feed(
             }
         }
         (Some(session), None) => {
-            lines.push(centered("no native journal for this session"));
-            lines.push(centered(&session.display_title()));
+            lines.extend(missing_journal_lines(session, width));
         }
         (None, _) => {
             lines.push(centered("no session selected"));
@@ -572,6 +630,72 @@ fn tail_feed(
                 .border_style(Style::default().fg(Color::Green)),
         )
         .scroll((scroll as u16, 0))
+}
+
+fn missing_journal_lines(session: &AgentSession, width: usize) -> Vec<Line<'static>> {
+    let pid = session
+        .pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let command = session.command.as_deref().unwrap_or("-");
+    let cwd = path_home_display(&session.cwd);
+    let full_cwd = session.cwd.display().to_string();
+    let source = if session.pid.is_some() {
+        format!(
+            "discovered as a live {} process from native state",
+            session.agent
+        )
+    } else {
+        format!("discovered from recent {} native state", session.agent)
+    };
+    let inspect = if let Some(pid) = session.pid {
+        format!("inspect: ps -p {pid} -o pid,ppid,etime,command")
+    } else {
+        "inspect: open the cwd below and check the agent terminal".to_string()
+    };
+    let stop = if let Some(pid) = session.pid {
+        format!("stop: exit the owning terminal/session; last resort kill {pid}")
+    } else {
+        "stop: no live pid is known; close the owning agent session if still open".to_string()
+    };
+
+    vec![
+        Line::from(Span::styled("no native journal linked", title_style())),
+        Line::from(truncate(
+            "aitop can see the process/session, but not a transcript file for it yet.",
+            width,
+        )),
+        blank(),
+        Line::from(Span::styled("what this is", title_style())),
+        Line::from(truncate(
+            &format!(
+                "live {} process named {}",
+                session.agent,
+                session.repo_name()
+            ),
+            width,
+        )),
+        Line::from(truncate(
+            "repo name comes from the working directory, not from aitop knowing the task.",
+            width,
+        )),
+        blank(),
+        kv("AGENT", &session.agent.to_string()),
+        kv("PID", &pid),
+        kv("COMMAND", command),
+        kv("CWD", &cwd),
+        kv("CWD FULL", &full_cwd),
+        kv("SOURCE", &source),
+        kv("THREAD", session.native_id.as_deref().unwrap_or("-")),
+        blank(),
+        Line::from(Span::styled("what you can do", title_style())),
+        Line::from(truncate(&inspect, width)),
+        Line::from(truncate(&stop, width)),
+        Line::from(truncate(
+            "aitop does not stop processes yet; it only shows the command to use.",
+            width,
+        )),
+    ]
 }
 
 fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
@@ -670,6 +794,8 @@ fn tail_footer(feed: Option<&SessionFeed>) -> Paragraph<'static> {
         .unwrap_or_else(|| ("-".into(), "-".into(), "-".into(), "-".into()));
     Paragraph::new(Line::from(vec![
         Span::styled(" up/down ", key_style()),
+        Span::raw(" select   "),
+        Span::styled("pgup/pgdn", key_style()),
         Span::raw(" scroll   "),
         Span::styled("esc", key_style()),
         Span::raw(" monitor   "),
@@ -788,5 +914,89 @@ fn status_style(status: SessionStatus) -> Style {
         SessionStatus::Running => Style::default().fg(Color::Green),
         SessionStatus::Recent | SessionStatus::Done => Style::default().fg(Color::Gray),
         SessionStatus::Unknown => Style::default().fg(Color::Yellow),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AgentKind, AgentSession};
+
+    #[test]
+    fn tail_up_down_changes_selected_session_and_resets_scroll() {
+        let mut mode = ViewMode::Tail { scroll: 9 };
+        let mut selected = 1usize;
+        let mut filter = SessionFilter::Active;
+
+        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::Down);
+
+        assert_eq!(selected, 2);
+        assert_eq!(tail_scroll(&mode), Some(0));
+
+        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::Up);
+
+        assert_eq!(selected, 1);
+        assert_eq!(tail_scroll(&mode), Some(0));
+    }
+
+    #[test]
+    fn tail_page_keys_scroll_feed_without_changing_selected_session() {
+        let mut mode = ViewMode::Tail { scroll: 4 };
+        let mut selected = 1usize;
+        let mut filter = SessionFilter::Active;
+
+        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::PageDown);
+
+        assert_eq!(selected, 1);
+        assert_eq!(tail_scroll(&mode), Some(9));
+
+        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::PageUp);
+
+        assert_eq!(selected, 1);
+        assert_eq!(tail_scroll(&mode), Some(4));
+    }
+
+    #[test]
+    fn missing_journal_context_explains_process_location_and_stop_path() {
+        let session = AgentSession {
+            agent: AgentKind::Codex,
+            native_id: Some("thread-1".to_string()),
+            title: None,
+            command: Some("codex".to_string()),
+            cwd: "/Users/sg/code/example/src-tauri".into(),
+            pid: Some(4242),
+            status: SessionStatus::Running,
+            started_at: None,
+            updated_at: None,
+            model: None,
+            tokens_total: None,
+            git_branch: None,
+            journal_path: None,
+            process: None,
+            git: None,
+        };
+
+        let text = lines_to_plain_text(missing_journal_lines(&session, 120));
+
+        assert!(text.contains("live codex process"));
+        assert!(text.contains("repo name comes from the working directory"));
+        assert!(text.contains("/Users/sg/code/example/src-tauri"));
+        assert!(text.contains("ps -p 4242"));
+        assert!(text.contains("kill 4242"));
+    }
+
+    fn tail_scroll(mode: &ViewMode) -> Option<usize> {
+        match mode {
+            ViewMode::Tail { scroll } => Some(*scroll),
+            ViewMode::Monitor => None,
+        }
+    }
+
+    fn lines_to_plain_text(lines: Vec<Line<'static>>) -> String {
+        lines
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
