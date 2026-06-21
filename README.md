@@ -17,8 +17,10 @@ It discovers native Claude and Codex activity without requiring wrapper commands
 - Recent Codex threads from `~/.codex/state_5.sqlite`
 - Claude journal metadata from `~/.claude/projects`
 - PID, CPU, memory, repo, branch, dirty files, model, and token totals where available
+- Focused session tails with normalized user/assistant/thinking/tool/usage events
+- Error, file-edit, command, and token-spike annotations where they can be inferred
 
-`aitop` reads local metadata and avoids displaying full transcript content in the dashboard.
+`aitop` keeps the monitor view metadata-first. Tail view intentionally renders the selected native journal so you can inspect a focused session.
 
 ## Install
 
@@ -50,7 +52,21 @@ Print a one-shot text snapshot:
 aitop --once
 ```
 
-Quit the dashboard with `q`. Use up/down or `j`/`k` to select a session.
+Monitor controls:
+
+- `up`/`down` or `j`/`k`: select a session
+- `enter`: open the focused tail view
+- `r`: refresh
+- `q`: quit
+
+Tail controls:
+
+- `up`/`down` or `j`/`k`: scroll
+- `g` / `G`: jump toward top or bottom
+- `esc`: return to monitor
+- `q`: quit
+
+Future idea: an ask-style footer REPL for questions about visible sessions, processes, git state, and recent events.
 
 ## Development
 

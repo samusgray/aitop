@@ -1,7 +1,9 @@
 pub mod app;
 pub mod codex;
 pub mod dashboard;
+pub mod feed;
 pub mod git;
 pub mod model;
+pub mod pricing;
 pub mod process;
 pub mod sources;
