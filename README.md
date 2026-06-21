@@ -1,29 +1,25 @@
 # aitop
 
-`aitop` is a small btop-inspired terminal dashboard for local AI agent activity.
+`aitop` is a btop-inspired terminal dashboard for local AI agent activity. It reads native Claude and Codex state directly, so you can see what is active, what recently ran, and what happened in the focused session without wrapping your agent commands.
 
-The primary flow is ambient:
+## What It Does
 
-```bash
-aitop
-```
-
-It discovers native Claude and Codex activity without requiring wrapper commands.
-
-## What the MVP Shows
-
-- Live Claude CLI sessions from `~/.claude/sessions/*.json`
-- Live Codex work from `~/.codex/process_manager/chat_processes.json`
-- Recent Codex threads from `~/.codex/state_5.sqlite`
-- Claude journal metadata from `~/.claude/projects`
-- PID, CPU, memory, repo, branch, dirty files, model, and token totals where available
-- A btop-inspired activity skyline showing recent CPU/token/git/session deltas over time
-- Focused session tails with normalized user/assistant/thinking/tool/usage events
-- Error, file-edit, command, and token-spike annotations where they can be inferred
-
-`aitop` keeps the monitor view metadata-first. Tail view intentionally renders the selected native journal so you can inspect a focused session.
+- Discovers Claude CLI sessions from `~/.claude/sessions/*.json`.
+- Reads Claude project journals from `~/.claude/projects`.
+- Discovers Codex work from `~/.codex/process_manager/chat_processes.json`.
+- Reads recent Codex threads from `~/.codex/state_5.sqlite`.
+- Shows live sessions only when the native process is actually alive.
+- Groups recent historical rows by project, while keeping genuinely live sessions distinct.
+- Hides stale missing-path sessions from the default overview.
+- Shows repo, branch, dirty files, PID, CPU, memory, model, token totals, and recent activity where available.
+- Provides a focused tail view with normalized user, assistant, thinking, tool, result, and usage events.
 
 ## Install
+
+Requirements:
+
+- Rust and Cargo
+- macOS or another Unix-like system with `kill`, `lsof`, and `git`
 
 From this repo:
 
@@ -31,7 +27,17 @@ From this repo:
 ./scripts/install.sh
 ```
 
-By default, this installs to `~/.local/bin/aitop`.
+By default, this builds a release binary and installs it to:
+
+```bash
+~/.local/bin/aitop
+```
+
+If `~/.local/bin` is not on your `PATH`, add this to your shell profile:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 Choose another install directory:
 
@@ -41,48 +47,54 @@ AITOP_INSTALL_DIR=/some/bin ./scripts/install.sh
 
 ## Usage
 
-Open the dashboard. By default, the session list shows active sessions only:
+Open the dashboard:
 
 ```bash
 aitop
 ```
 
-Print a one-shot text snapshot:
+Print one text snapshot:
 
 ```bash
 aitop --once
 ```
 
-Run with simulated live activity:
+Run with simulated demo data:
 
 ```bash
 aitop --demo
 aitop --once --demo
 ```
 
-Monitor controls:
+## Controls
 
-- `up`/`down` or `j`/`k`: select a session
+Monitor view:
+
+- `up` / `down` or `j` / `k`: select a session
 - `enter`: open the focused tail view
-- `a`: toggle active-only and all sessions
+- `a`: cycle overview, active, and all views
 - `r`: refresh
 - `q`: quit
 
-Tail controls:
+Tail view:
 
-- `up`/`down` or `j`/`k`: select a session
-- `page up` / `page down`: scroll the focused session feed
+- `j` / `k`: scroll the focused log feed
+- `up` / `down`: select another session
+- `page up` / `page down`: scroll by larger jumps
 - `g` / `G`: jump toward top or bottom
 - `esc`: return to monitor
-- `a`: return to monitor and toggle active-only/all sessions
+- `a`: return to monitor and cycle views
 - `q`: quit
-
-Future idea: an ask-style footer REPL for questions about visible sessions, processes, git state, and recent events.
 
 ## Development
 
 ```bash
 cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- --once
 cargo run
 ```
+
+## License
+
+`aitop` is released under the MIT License. See [LICENSE](LICENSE).

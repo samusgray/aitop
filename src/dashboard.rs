@@ -24,10 +24,10 @@ use ratatui::{
 
 use crate::{
     app::{
-        AmbientSnapshot, SessionFilter, demo_snapshot, format_bytes, snapshot_with_sampler,
-        visible_sessions,
+        AmbientSnapshot, SessionFilter, demo_feed, demo_snapshot, format_bytes,
+        snapshot_with_sampler, visible_sessions,
     },
-    feed::{FeedEvent, FeedRecord, SessionFeed, annotation_summary, load_session_feed},
+    feed::{Annotation, FeedEvent, FeedRecord, SessionFeed, load_session_feed},
     model::{AgentSession, SessionStatus, elapsed_label, path_home_display, time_label},
     pricing::{compact_tokens, short_model},
     process::ProcessSampler,
@@ -35,6 +35,7 @@ use crate::{
 
 const INPUT_TICK: Duration = Duration::from_millis(75);
 const REFRESH_TICK: Duration = Duration::from_millis(1000);
+const SKYLINE_FULL_SCALE_SCORE: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardSource {
@@ -116,6 +117,7 @@ impl ActivitySkyline {
 #[derive(Debug, Clone, Default)]
 struct ActivityScorer {
     previous: BTreeMap<String, SessionObservation>,
+    previous_activity: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +138,7 @@ impl ActivityScorer {
             .collect::<BTreeMap<_, _>>();
         if self.previous.is_empty() {
             self.previous = current;
+            self.previous_activity = snapshot.activity.clone();
             return ActivitySample::quiet();
         }
 
@@ -186,15 +189,17 @@ impl ActivityScorer {
             }
         }
 
-        if snapshot
-            .activity
-            .iter()
-            .any(|line| line.contains("changed"))
+        if snapshot.activity != self.previous_activity
+            && snapshot
+                .activity
+                .iter()
+                .any(|line| line.contains("changed"))
         {
             score += 2;
         }
 
         self.previous = current;
+        self.previous_activity = snapshot.activity.clone();
         let score = score.min(100);
         let tone = if hot {
             ActivityTone::Hot
@@ -258,7 +263,7 @@ fn run_loop(
 ) -> Result<()> {
     let mut selected = 0usize;
     let mut mode = ViewMode::Monitor;
-    let mut filter = SessionFilter::Active;
+    let mut filter = SessionFilter::Overview;
     let (snapshot_tx, snapshot_rx) = mpsc::channel();
     spawn_snapshot_worker(source, snapshot_tx);
     let mut sampler = ProcessSampler::new();
@@ -280,7 +285,16 @@ fn run_loop(
         if needs_draw {
             terminal.draw(|frame| {
                 draw(
-                    frame, &snapshot, &sessions, selected, &mode, filter, &skyline,
+                    frame,
+                    DrawContext {
+                        source,
+                        snapshot: &snapshot,
+                        sessions: &sessions,
+                        selected,
+                        mode: &mode,
+                        filter,
+                        skyline: &skyline,
+                    },
                 )
             })?;
             needs_draw = false;
@@ -365,14 +379,30 @@ fn handle_key(
             *mode = ViewMode::Tail { scroll: 0 };
             KeyAction::Continue
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Char('j') => {
+            if let ViewMode::Tail { scroll } = mode {
+                *scroll = scroll.saturating_add(1);
+            } else {
+                *selected = (*selected + 1).min(session_count.saturating_sub(1));
+            }
+            KeyAction::Continue
+        }
+        KeyCode::Char('k') => {
+            if let ViewMode::Tail { scroll } = mode {
+                *scroll = scroll.saturating_sub(1);
+            } else {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyAction::Continue
+        }
+        KeyCode::Down => {
             *selected = (*selected + 1).min(session_count.saturating_sub(1));
             if let ViewMode::Tail { scroll } = mode {
                 *scroll = 0;
             }
             KeyAction::Continue
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             *selected = selected.saturating_sub(1);
             if let ViewMode::Tail { scroll } = mode {
                 *scroll = 0;
@@ -408,20 +438,37 @@ fn handle_key(
     }
 }
 
-fn draw(
-    frame: &mut Frame<'_>,
-    snapshot: &AmbientSnapshot,
-    sessions: &[AgentSession],
+struct DrawContext<'a> {
+    source: DashboardSource,
+    snapshot: &'a AmbientSnapshot,
+    sessions: &'a [AgentSession],
     selected: usize,
-    mode: &ViewMode,
+    mode: &'a ViewMode,
     filter: SessionFilter,
-    skyline: &ActivitySkyline,
-) {
+    skyline: &'a ActivitySkyline,
+}
+
+fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
     let area = frame.area();
     frame.render_widget(Clear, area);
-    match mode {
-        ViewMode::Monitor => draw_monitor(frame, snapshot, sessions, selected, filter, skyline),
-        ViewMode::Tail { scroll } => draw_tail(frame, sessions, selected, *scroll, filter),
+    match context.mode {
+        ViewMode::Monitor => draw_monitor(
+            frame,
+            context.snapshot,
+            context.sessions,
+            context.selected,
+            context.filter,
+            context.skyline,
+        ),
+        ViewMode::Tail { scroll } => draw_tail(
+            frame,
+            context.source,
+            context.sessions,
+            context.selected,
+            *scroll,
+            context.filter,
+            context.skyline,
+        ),
     }
 }
 
@@ -437,6 +484,7 @@ fn skyline_rows(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<S
 struct SkylineColumn {
     cells: Vec<char>,
     tone: ActivityTone,
+    colors: Vec<Color>,
 }
 
 fn skyline_columns(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<SkylineColumn> {
@@ -448,17 +496,12 @@ fn skyline_columns(skyline: &ActivitySkyline, width: usize, height: usize) -> Ve
         .copied()
         .collect::<Vec<_>>();
     samples.reverse();
-    let max_score = samples
-        .iter()
-        .map(|sample| sample.score)
-        .max()
-        .unwrap_or(1)
-        .max(1);
     let mut columns = Vec::with_capacity(width);
     if samples.len() < width {
         columns.extend((0..(width - samples.len())).map(|_| SkylineColumn {
             cells: vec![' '; height],
             tone: ActivityTone::Quiet,
+            colors: vec![color_for_tone(ActivityTone::Quiet); height],
         }));
     }
 
@@ -466,15 +509,25 @@ fn skyline_columns(skyline: &ActivitySkyline, width: usize, height: usize) -> Ve
         let level = if sample.score == 0 {
             0
         } else {
-            (sample.score as usize * height).div_ceil(max_score as usize)
+            (sample.score as usize * height)
+                .div_ceil(SKYLINE_FULL_SCALE_SCORE)
+                .clamp(1, height)
         };
-        let dot = dot_for_tone(sample.tone);
-        let cells = (0..height)
-            .map(|row| if height - row <= level { dot } else { ' ' })
-            .collect::<Vec<_>>();
+        let mut cells = Vec::with_capacity(height);
+        let mut colors = Vec::with_capacity(height);
+        for row in 0..height {
+            if height - row <= level {
+                cells.push('▪');
+                colors.push(color_for_layer(height - row, height, sample.tone));
+            } else {
+                cells.push(' ');
+                colors.push(color_for_tone(ActivityTone::Quiet));
+            }
+        }
         columns.push(SkylineColumn {
             cells,
             tone: sample.tone,
+            colors,
         });
     }
     columns
@@ -489,7 +542,7 @@ fn skyline_lines(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<
         for column in &columns {
             spans.push(Span::styled(
                 column.cells[row].to_string(),
-                Style::default().fg(color_for_tone(column.tone)),
+                Style::default().fg(column.colors[row]),
             ));
         }
         rows.push(Line::from(spans));
@@ -497,13 +550,13 @@ fn skyline_lines(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<
     rows
 }
 
-fn dot_for_tone(tone: ActivityTone) -> char {
-    match tone {
-        ActivityTone::Quiet => ' ',
-        ActivityTone::Low => '.',
-        ActivityTone::Medium => ':',
-        ActivityTone::High => '*',
-        ActivityTone::Hot => '#',
+fn color_for_layer(layer: usize, height: usize, tone: ActivityTone) -> Color {
+    let pct = (layer * 100) / height.max(1);
+    match (tone, pct) {
+        (ActivityTone::Hot, 76..=100) => Color::Red,
+        (_, 0..=35) => Color::Rgb(90, 170, 110),
+        (_, 36..=70) => Color::Rgb(190, 210, 110),
+        _ => Color::Rgb(230, 170, 80),
     }
 }
 
@@ -808,23 +861,42 @@ fn render_activity(frame: &mut Frame<'_>, snapshot: &AmbientSnapshot, area: Rect
 }
 
 fn activity(snapshot: &AmbientSnapshot, width: usize) -> Paragraph<'static> {
-    let lines = if snapshot.activity.is_empty() {
-        vec![Line::from(" -   watch   native Claude/Codex activity")]
-    } else {
-        snapshot
-            .activity
-            .iter()
-            .map(|line| Line::from(truncate(line, width)))
-            .collect()
-    };
-    Paragraph::new(lines).block(
+    Paragraph::new(activity_lines(snapshot, width)).block(
         Block::default()
             .title(Line::from(vec![
                 Span::styled(" activity ", title_style()),
-                Span::styled("recent project events ", dim()),
+                Span::styled(activity_subtitle(snapshot), dim()),
             ]))
             .borders(Borders::ALL),
     )
+}
+
+fn activity_lines(snapshot: &AmbientSnapshot, width: usize) -> Vec<Line<'static>> {
+    if snapshot.active_count() == 0 {
+        return vec![Line::from(truncate(
+            " -   watching native sources - no live agent activity",
+            width,
+        ))];
+    }
+    if snapshot.activity.is_empty() {
+        return vec![Line::from(truncate(
+            " -   watching native Claude/Codex activity",
+            width,
+        ))];
+    }
+    snapshot
+        .activity
+        .iter()
+        .map(|line| Line::from(truncate(line, width)))
+        .collect()
+}
+
+fn activity_subtitle(snapshot: &AmbientSnapshot) -> &'static str {
+    if snapshot.active_count() == 0 {
+        "idle "
+    } else {
+        "live project events "
+    }
 }
 
 fn monitor_footer() -> Paragraph<'static> {
@@ -836,7 +908,7 @@ fn monitor_footer() -> Paragraph<'static> {
         Span::styled("r", key_style()),
         Span::raw(" refresh   "),
         Span::styled("a", key_style()),
-        Span::raw(" all/active   "),
+        Span::raw(" view   "),
         Span::styled("q", key_style()),
         Span::raw(" quit   "),
         Span::styled("future", dim()),
@@ -847,10 +919,12 @@ fn monitor_footer() -> Paragraph<'static> {
 
 fn draw_tail(
     frame: &mut Frame<'_>,
+    source: DashboardSource,
     sessions: &[AgentSession],
     selected: usize,
     scroll: usize,
     filter: SessionFilter,
+    skyline: &ActivitySkyline,
 ) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -864,7 +938,8 @@ fn draw_tail(
     frame.render_widget(Clear, body[0]);
     frame.render_widget(tail_sidebar(sessions, selected, filter), body[0]);
     let selected_session = sessions.get(selected);
-    let feed = selected_session.and_then(load_feed_for_session);
+    let feed = selected_session
+        .and_then(|session| load_feed_for_session(source, session, skyline.samples.len() as u64));
     frame.render_widget(Clear, body[1]);
     frame.render_widget(
         tail_feed(
@@ -930,10 +1005,19 @@ fn tail_sidebar(
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
 }
 
-fn load_feed_for_session(session: &AgentSession) -> Option<SessionFeed> {
-    let path = session.journal_path.as_ref()?;
-    let id = session.native_id.as_deref().unwrap_or("-");
-    load_session_feed(path, session.agent, id, 600).ok()
+fn load_feed_for_session(
+    source: DashboardSource,
+    session: &AgentSession,
+    tick: u64,
+) -> Option<SessionFeed> {
+    match source {
+        DashboardSource::Demo => Some(demo_feed(session, tick)),
+        DashboardSource::Native => {
+            let path = session.journal_path.as_ref()?;
+            let id = session.native_id.as_deref().unwrap_or("-");
+            load_session_feed(path, session.agent, id, 600).ok()
+        }
+    }
 }
 
 fn tail_feed(
@@ -1062,26 +1146,18 @@ fn missing_journal_lines(session: &AgentSession, width: usize) -> Vec<Line<'stat
 }
 
 fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
-    let badge = annotation_summary(&record.annotations);
-    let badge = if badge.is_empty() {
-        Vec::new()
-    } else {
-        vec![
-            Span::raw(" "),
-            Span::styled(format!("[{badge}]"), Style::default().fg(Color::Yellow)),
-        ]
-    };
+    let badge = annotation_badges(&record.annotations);
     match &record.event {
         FeedEvent::User { text } => {
             let mut spans = vec![
-                Span::styled("> you ", Style::default().fg(Color::Cyan)),
+                Span::styled("› you ", Style::default().fg(Color::Cyan)),
                 Span::raw(truncate(text, width.saturating_sub(6))),
             ];
             spans.extend(badge);
             vec![Line::from(spans)]
         }
         FeedEvent::Assistant { text, .. } => {
-            let mut lines = vec![Line::from(vec![Span::styled("* assistant", accent())])];
+            let mut lines = vec![Line::from(vec![Span::styled("✦ assistant", accent())])];
             lines.push(Line::from(format!(
                 "  {}",
                 truncate(text, width.saturating_sub(2))
@@ -1089,7 +1165,7 @@ fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
             lines
         }
         FeedEvent::Thinking { text } => vec![Line::from(vec![
-            Span::styled("~ thinking ", dim()),
+            Span::styled("✻ thinking ", dim()),
             Span::styled(
                 truncate(text, width.saturating_sub(11)),
                 Style::default()
@@ -1099,7 +1175,7 @@ fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
         ])],
         FeedEvent::ToolCall { name, summary, .. } => {
             let mut spans = vec![
-                Span::styled("# ", Style::default().fg(Color::Yellow)),
+                Span::styled("⚙ ", Style::default().fg(Color::Yellow)),
                 Span::styled(
                     name.clone(),
                     Style::default()
@@ -1121,10 +1197,18 @@ fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
             } else {
                 Style::default().fg(Color::Red)
             };
-            let mut lines = vec![Line::from(vec![Span::styled("` result", style)])];
+            let mut header = vec![Span::styled("↳", dim()), Span::raw(" ")];
+            if !ok || record.annotations.contains(&Annotation::Error) {
+                header.push(Span::styled(
+                    "⚠ ERR ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            }
+            header.push(Span::styled("result", style));
+            let mut lines = vec![Line::from(header)];
             for line in detail.lines().take(10) {
                 lines.push(Line::from(vec![
-                    Span::raw("  "),
+                    Span::styled("  │ ", dim()),
                     Span::styled(truncate(line, width.saturating_sub(2)), style),
                 ]));
             }
@@ -1140,6 +1224,36 @@ fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
         ))],
         FeedEvent::Unknown { kind } => vec![Line::from(Span::styled(format!("? {kind}"), dim()))],
     }
+}
+
+fn annotation_badges(annotations: &[Annotation]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for annotation in annotations {
+        match annotation {
+            Annotation::Error => spans.extend([
+                Span::raw(" "),
+                Span::styled(
+                    "⚠ ERR",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Annotation::TokenSpike { tokens } => spans.extend([
+                Span::raw(" "),
+                Span::styled(
+                    format!("⚡ {}", compact_tokens(*tokens)),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            Annotation::FileTouched(path) => {
+                spans.extend([Span::raw(" "), Span::styled(format!("file {path}"), dim())])
+            }
+            Annotation::CommandRun(command) => spans.extend([
+                Span::raw(" "),
+                Span::styled(format!("cmd {}", truncate(command, 28)), dim()),
+            ]),
+        }
+    }
+    spans
 }
 
 fn tail_footer(feed: Option<&SessionFeed>) -> Paragraph<'static> {
@@ -1163,7 +1277,7 @@ fn tail_footer(feed: Option<&SessionFeed>) -> Paragraph<'static> {
         Span::styled("esc", key_style()),
         Span::raw(" monitor   "),
         Span::styled("a", key_style()),
-        Span::raw(" all/active   "),
+        Span::raw(" view   "),
         Span::styled("q", key_style()),
         Span::raw(" quit   "),
         Span::styled(
@@ -1303,6 +1417,23 @@ mod tests {
     }
 
     #[test]
+    fn tail_jk_scrolls_feed_without_changing_selected_session() {
+        let mut mode = ViewMode::Tail { scroll: 4 };
+        let mut selected = 1usize;
+        let mut filter = SessionFilter::Active;
+
+        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::Char('j'));
+
+        assert_eq!(selected, 1);
+        assert_eq!(tail_scroll(&mode), Some(5));
+
+        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::Char('k'));
+
+        assert_eq!(selected, 1);
+        assert_eq!(tail_scroll(&mode), Some(4));
+    }
+
+    #[test]
     fn tail_page_keys_scroll_feed_without_changing_selected_session() {
         let mut mode = ViewMode::Tail { scroll: 4 };
         let mut selected = 1usize;
@@ -1349,6 +1480,21 @@ mod tests {
     }
 
     #[test]
+    fn activity_panel_is_quiet_when_no_sessions_are_active() {
+        let snapshot = AmbientSnapshot {
+            sessions: vec![test_session("recent", SessionStatus::Recent, "/repo", 10)],
+            generated_at: SystemTime::UNIX_EPOCH,
+            activity: vec!["04:25:19 observed recent - codex".to_string()],
+        };
+
+        let text = lines_to_plain_text(activity_lines(&snapshot, 120));
+
+        assert!(text.contains("watching native sources"));
+        assert!(text.contains("no live agent activity"));
+        assert!(!text.contains("observed recent"));
+    }
+
+    #[test]
     fn skyline_rolls_scores_and_discards_oldest_columns() {
         let mut skyline = ActivitySkyline::new(3);
 
@@ -1370,9 +1516,9 @@ mod tests {
         let rows = skyline_rows(&skyline, 3, 3);
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], "  :");
-        assert_eq!(rows[1], " .:");
-        assert_eq!(rows[2], " .:");
+        assert_eq!(rows[0], "   ");
+        assert_eq!(rows[1], "   ");
+        assert_eq!(rows[2], " ▪▪");
     }
 
     #[test]
@@ -1420,6 +1566,41 @@ mod tests {
     }
 
     #[test]
+    fn skyline_ignores_repeated_stale_activity_lines() {
+        let mut session = test_session("live", SessionStatus::Running, "/repo", 40);
+        session.process = Some(ProcessStats {
+            cpu_percent: 0,
+            memory_bytes: 128 * 1024 * 1024,
+            child_pids: vec![],
+        });
+        let first = AmbientSnapshot {
+            sessions: vec![session.clone()],
+            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(45),
+            activity: vec!["11:27:15 changed M src/lib.rs".to_string()],
+        };
+        let repeated = AmbientSnapshot {
+            sessions: vec![session],
+            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(46),
+            activity: vec!["11:27:15 changed M src/lib.rs".to_string()],
+        };
+
+        let mut scorer = ActivityScorer::default();
+
+        assert_eq!(scorer.score(&first), ActivitySample::quiet());
+        assert_eq!(scorer.score(&repeated), ActivitySample::quiet());
+    }
+
+    #[test]
+    fn skyline_uses_absolute_scale_for_low_scores() {
+        let mut skyline = ActivitySkyline::new(8);
+        skyline.push_sample(ActivitySample::new(2, ActivityTone::Low));
+
+        let rows = skyline_rows(&skyline, 1, 5);
+
+        assert_eq!(rows, vec![" ", " ", " ", " ", "▪"]);
+    }
+
+    #[test]
     fn skyline_render_preserves_tone_for_colored_columns() {
         let mut skyline = ActivitySkyline::new(8);
         skyline.push_sample(ActivitySample::new(1, ActivityTone::Low));
@@ -1438,6 +1619,43 @@ mod tests {
                 ActivityTone::Hot
             ]
         );
+    }
+
+    #[test]
+    fn feed_record_lines_use_aitail_style_badges_and_result_panels() {
+        let error = FeedRecord {
+            session_id: "auth-service".to_string(),
+            timestamp: None,
+            event: FeedEvent::ToolResult {
+                id: "tool-1".to_string(),
+                ok: false,
+                summary: "failed".to_string(),
+                detail: "FAIL test/session.spec.ts\nError: connect ECONNREFUSED 127.0.0.1:6379"
+                    .to_string(),
+            },
+            annotations: vec![crate::feed::Annotation::Error],
+        };
+        let text = lines_to_plain_text(feed_record_lines(&error, 100));
+
+        assert!(text.contains("↳"));
+        assert!(text.contains("⚠ ERR"));
+        assert!(text.contains("FAIL test/session.spec.ts"));
+        assert!(text.contains("│"));
+    }
+
+    #[test]
+    fn skyline_columns_use_one_pixel_glyph_not_punctuation_bands() {
+        let mut skyline = ActivitySkyline::new(4);
+        skyline.push_sample(ActivitySample::new(8, ActivityTone::Low));
+        skyline.push_sample(ActivitySample::new(14, ActivityTone::Hot));
+
+        let rows = skyline_rows(&skyline, 2, 4).join("\n");
+
+        assert!(rows.contains('▪'));
+        assert!(!rows.contains('.'));
+        assert!(!rows.contains(':'));
+        assert!(!rows.contains('*'));
+        assert!(!rows.contains('#'));
     }
 
     fn tail_scroll(mode: &ViewMode) -> Option<usize> {

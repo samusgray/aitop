@@ -1,5 +1,7 @@
 use std::cmp::Reverse;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -40,22 +42,29 @@ pub fn read_process_manager(path: &Path) -> Result<Vec<AgentSession>> {
 
     let mut sessions = processes
         .into_iter()
-        .map(|process| AgentSession {
-            agent: AgentKind::Codex,
-            native_id: Some(process.conversation_id),
-            title: process.chat_title,
-            command: Some(process.command),
-            cwd: process.cwd,
-            pid: process.os_pid,
-            status: SessionStatus::Running,
-            started_at: process.started_at_ms.and_then(unix_millis),
-            updated_at: process.updated_at_ms.and_then(unix_millis),
-            model: None,
-            tokens_total: None,
-            git_branch: None,
-            journal_path: None,
-            process: None,
-            git: None,
+        .map(|process| {
+            let status = if process.os_pid.is_some_and(pid_is_alive) {
+                SessionStatus::Running
+            } else {
+                SessionStatus::Recent
+            };
+            AgentSession {
+                agent: AgentKind::Codex,
+                native_id: Some(process.conversation_id),
+                title: process.chat_title,
+                command: Some(process.command),
+                cwd: process.cwd,
+                pid: process.os_pid,
+                status,
+                started_at: process.started_at_ms.and_then(unix_millis),
+                updated_at: process.updated_at_ms.and_then(unix_millis),
+                model: None,
+                tokens_total: None,
+                git_branch: None,
+                journal_path: None,
+                process: None,
+                git: None,
+            }
         })
         .collect::<Vec<_>>();
     sessions.sort_by_key(|session| Reverse(session.updated_at));
@@ -82,6 +91,27 @@ pub fn read_threads_from_db(path: &Path, limit: usize) -> Result<Vec<AgentSessio
         let tokens_total: Option<i64> = row.get(6)?;
         let git_branch: Option<String> = row.get(7)?;
         let model: Option<String> = row.get(8)?;
+        let rollout_metadata = rollout_path
+            .as_deref()
+            .and_then(|path| read_rollout_metadata(Path::new(path)).ok());
+        let cwd = if cwd.is_empty() {
+            rollout_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.cwd.clone())
+                .unwrap_or_else(|| ".".to_string())
+        } else {
+            cwd
+        };
+        let model = model.or_else(|| {
+            rollout_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.model.clone())
+        });
+        let tokens_total = tokens_total.or_else(|| {
+            rollout_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.tokens_total)
+        });
         Ok(AgentSession {
             agent: AgentKind::Codex,
             native_id: Some(id),
@@ -102,4 +132,74 @@ pub fn read_threads_from_db(path: &Path, limit: usize) -> Result<Vec<AgentSessio
     })?;
 
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[derive(Debug, Default)]
+struct RolloutMetadata {
+    cwd: Option<String>,
+    model: Option<String>,
+    tokens_total: Option<i64>,
+}
+
+fn read_rollout_metadata(path: &Path) -> Result<RolloutMetadata> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let size = file.metadata()?.len();
+    let head_len = size.min(64 * 1024) as usize;
+    let mut head = vec![0; head_len];
+    file.read_exact(&mut head)?;
+
+    let tail_len = size.min(64 * 1024) as usize;
+    let mut tail = vec![0; tail_len];
+    file.seek(SeekFrom::End(-(tail_len as i64)))?;
+    file.read_exact(&mut tail)?;
+
+    let mut metadata = RolloutMetadata::default();
+    parse_rollout_chunk(&String::from_utf8_lossy(&head), &mut metadata);
+    parse_rollout_chunk(&String::from_utf8_lossy(&tail), &mut metadata);
+    Ok(metadata)
+}
+
+fn parse_rollout_chunk(chunk: &str, metadata: &mut RolloutMetadata) {
+    for line in chunk.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if metadata.cwd.is_none() {
+            metadata.cwd = value
+                .pointer("/payload/cwd")
+                .or_else(|| value.pointer("/payload/turn_context/cwd"))
+                .or_else(|| value.get("cwd"))
+                .and_then(|cwd| cwd.as_str())
+                .map(ToOwned::to_owned);
+        }
+        if metadata.model.is_none() {
+            metadata.model = value
+                .pointer("/payload/model")
+                .or_else(|| value.pointer("/payload/model_slug"))
+                .or_else(|| value.pointer("/payload/turn_context/model"))
+                .or_else(|| value.pointer("/payload/turn_context/model_slug"))
+                .or_else(|| value.get("model"))
+                .and_then(|model| model.as_str())
+                .map(ToOwned::to_owned);
+        }
+        if let Some(tokens) = value
+            .pointer("/payload/token_count")
+            .or_else(|| value.pointer("/payload/info/total_token_usage/total_tokens"))
+            .or_else(|| value.pointer("/token_count"))
+            .and_then(|tokens| tokens.as_i64())
+        {
+            metadata.tokens_total = Some(tokens);
+        }
+    }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }

@@ -2,13 +2,14 @@ use std::{
     cmp::Reverse,
     fs,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::SystemTime,
 };
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::model::{AgentKind, AgentSession, SessionStatus, unix_seconds};
+use crate::model::{AgentKind, AgentSession, SessionStatus, unix_millis};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,9 +57,9 @@ pub fn read_claude_sessions(dir: &Path) -> Result<Vec<AgentSession>> {
             command: parsed.entrypoint,
             cwd: parsed.cwd,
             pid: Some(parsed.pid),
-            status: claude_status(parsed.status.as_deref()),
-            started_at: parsed.started_at.and_then(unix_seconds),
-            updated_at: parsed.updated_at.and_then(unix_seconds),
+            status: claude_status(parsed.status.as_deref(), parsed.pid),
+            started_at: parsed.started_at.and_then(unix_millis),
+            updated_at: parsed.updated_at.and_then(unix_millis),
             model: None,
             tokens_total: None,
             git_branch: None,
@@ -262,12 +263,23 @@ fn attach_claude_journal_metadata(session: &mut AgentSession, path: &Path) {
     }
 }
 
-fn claude_status(status: Option<&str>) -> SessionStatus {
+fn claude_status(status: Option<&str>, pid: u32) -> SessionStatus {
     match status {
         Some("done") | Some("exited") | Some("complete") | Some("completed") => SessionStatus::Done,
-        Some(_) => SessionStatus::Running,
-        None => SessionStatus::Running,
+        Some("busy") if pid_is_alive(pid) => SessionStatus::Running,
+        _ => SessionStatus::Recent,
     }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 pub fn decode_project_dir(name: &str) -> Option<PathBuf> {
