@@ -2,6 +2,10 @@
 
 `aitop` is a btop-inspired terminal dashboard for local AI agent activity. It reads native Claude and Codex state directly, so you can see what is active, what recently ran, and what happened in the focused session without wrapping your agent commands.
 
+<img width="1484" height="981" alt="Screenshot 2026-06-21 at 5 49 31 AM" src="https://github.com/user-attachments/assets/297a7f79-0017-4d5b-a8ed-d72c94156b38" />
+
+<img width="1478" height="1024" alt="Screenshot 2026-06-21 at 5 49 53 AM" src="https://github.com/user-attachments/assets/4ada2420-6a3d-4d06-879c-e4d251b8082e" />
+
 ## What It Does
 
 - Discovers Claude CLI sessions from `~/.claude/sessions/*.json`.
