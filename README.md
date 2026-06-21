@@ -17,6 +17,7 @@ It discovers native Claude and Codex activity without requiring wrapper commands
 - Recent Codex threads from `~/.codex/state_5.sqlite`
 - Claude journal metadata from `~/.claude/projects`
 - PID, CPU, memory, repo, branch, dirty files, model, and token totals where available
+- A btop-inspired activity skyline showing recent ambient agent activity over time
 - Focused session tails with normalized user/assistant/thinking/tool/usage events
 - Error, file-edit, command, and token-spike annotations where they can be inferred
 

@@ -1,6 +1,7 @@
 use std::{
+    collections::VecDeque,
     io,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
@@ -41,6 +42,36 @@ enum KeyAction {
     Quit,
 }
 
+struct ActivitySkyline {
+    scores: VecDeque<u32>,
+    capacity: usize,
+}
+
+impl ActivitySkyline {
+    fn new(capacity: usize) -> Self {
+        Self {
+            scores: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push_snapshot(&mut self, snapshot: &AmbientSnapshot) {
+        self.push_score(activity_score(&snapshot.sessions, snapshot.generated_at));
+    }
+
+    fn push_score(&mut self, score: u32) {
+        if self.scores.len() == self.capacity {
+            self.scores.pop_front();
+        }
+        self.scores.push_back(score);
+    }
+
+    #[cfg(test)]
+    fn scores(&self) -> Vec<u32> {
+        self.scores.iter().copied().collect()
+    }
+}
+
 pub fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -59,12 +90,18 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
     let mut filter = SessionFilter::Active;
     let mut sampler = ProcessSampler::new();
     let mut snapshot = snapshot_with_sampler(&mut sampler)?;
+    let mut skyline = ActivitySkyline::new(160);
+    skyline.push_snapshot(&snapshot);
     let mut last_refresh = Instant::now();
 
     loop {
         let sessions = visible_sessions(&snapshot.sessions, filter);
         selected = clamp_selected(selected, sessions.len());
-        terminal.draw(|frame| draw(frame, &snapshot, &sessions, selected, &mode, filter))?;
+        terminal.draw(|frame| {
+            draw(
+                frame, &snapshot, &sessions, selected, &mode, filter, &skyline,
+            )
+        })?;
 
         if event::poll(INPUT_TICK)?
             && let Event::Key(key) = event::read()?
@@ -79,6 +116,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
                 KeyAction::Quit => return Ok(()),
                 KeyAction::Refresh => {
                     snapshot = snapshot_with_sampler(&mut sampler)?;
+                    skyline.push_snapshot(&snapshot);
                     last_refresh = Instant::now();
                 }
                 KeyAction::Continue => {}
@@ -87,6 +125,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
 
         if last_refresh.elapsed() >= REFRESH_TICK {
             snapshot = snapshot_with_sampler(&mut sampler)?;
+            skyline.push_snapshot(&snapshot);
             last_refresh = Instant::now();
         }
     }
@@ -168,13 +207,87 @@ fn draw(
     selected: usize,
     mode: &ViewMode,
     filter: SessionFilter,
+    skyline: &ActivitySkyline,
 ) {
     let area = frame.area();
     frame.render_widget(Clear, area);
     match mode {
-        ViewMode::Monitor => draw_monitor(frame, snapshot, sessions, selected, filter),
+        ViewMode::Monitor => draw_monitor(frame, snapshot, sessions, selected, filter, skyline),
         ViewMode::Tail { scroll } => draw_tail(frame, sessions, selected, *scroll, filter),
     }
+}
+
+fn activity_score(sessions: &[AgentSession], now: SystemTime) -> u32 {
+    sessions
+        .iter()
+        .map(|session| session_activity_score(session, now))
+        .sum::<u32>()
+        .min(100)
+}
+
+fn session_activity_score(session: &AgentSession, now: SystemTime) -> u32 {
+    let mut score = 0;
+    if session.status == SessionStatus::Running {
+        score += 3;
+    }
+    if let Some(process) = &session.process {
+        score += (process.cpu_percent / 10).min(6);
+        score += (process.memory_bytes / (256 * 1024 * 1024)).min(4) as u32;
+        score += process.child_pids.len().min(3) as u32;
+    }
+    if let Some(updated_at) = session.updated_at
+        && now
+            .duration_since(updated_at)
+            .map(|duration| duration <= Duration::from_secs(60))
+            .unwrap_or(false)
+    {
+        score += 2;
+    }
+    if session.tokens_total.unwrap_or(0) > 0 {
+        score += 1;
+    }
+    score += session.dirty_count().min(3) as u32;
+    score
+}
+
+fn skyline_rows(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<String> {
+    let mut values = skyline
+        .scores
+        .iter()
+        .rev()
+        .take(width)
+        .copied()
+        .collect::<Vec<_>>();
+    values.reverse();
+    let max_score = values.iter().copied().max().unwrap_or(1).max(1);
+    let mut rows = Vec::with_capacity(height);
+
+    for row in 0..height {
+        let threshold = height - row;
+        let mut line = String::with_capacity(width);
+        for score in &values {
+            if *score == 0 {
+                line.push(' ');
+                continue;
+            }
+            let level = (*score as usize * height).div_ceil(max_score as usize);
+            if level >= threshold {
+                let dot = if *score == max_score && threshold < height {
+                    ':'
+                } else {
+                    '.'
+                };
+                line.push(dot);
+            } else {
+                line.push(' ');
+            }
+        }
+        if line.len() < width {
+            line = format!("{}{}", " ".repeat(width - line.len()), line);
+        }
+        rows.push(line);
+    }
+    rows
 }
 
 fn draw_monitor(
@@ -183,36 +296,62 @@ fn draw_monitor(
     sessions: &[AgentSession],
     selected: usize,
     filter: SessionFilter,
+    skyline: &ActivitySkyline,
 ) {
+    let compact = frame.area().height < 32;
+    let skyline_height = if compact { 5 } else { 7 };
+    let activity_height = if compact { 5 } else { 7 };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(16),
-            Constraint::Length(8),
+            Constraint::Length(skyline_height),
+            Constraint::Min(9),
+            Constraint::Length(activity_height),
             Constraint::Length(2),
         ])
         .split(frame.area());
 
     frame.render_widget(Clear, vertical[0]);
     frame.render_widget(header(snapshot, filter), vertical[0]);
+    render_skyline(frame, skyline, vertical[1]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(61), Constraint::Percentage(39)])
-        .split(vertical[1]);
+        .split(vertical[2]);
 
     frame.render_widget(Clear, main[0]);
     frame.render_widget(session_table(snapshot, sessions, selected, filter), main[0]);
     frame.render_widget(Clear, main[1]);
     frame.render_widget(session_detail(sessions.get(selected)), main[1]);
-    render_activity(frame, snapshot, vertical[2]);
-    frame.render_widget(Clear, vertical[3]);
-    frame.render_widget(monitor_footer(), vertical[3]);
+    render_activity(frame, snapshot, vertical[3]);
+    frame.render_widget(Clear, vertical[4]);
+    frame.render_widget(monitor_footer(), vertical[4]);
 
     if sessions.is_empty() {
         draw_empty_state(frame, main[0]);
     }
+}
+
+fn render_skyline(frame: &mut Frame<'_>, skyline: &ActivitySkyline, area: Rect) {
+    frame.render_widget(Clear, area);
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let rows = skyline_rows(skyline, inner_width, area.height.saturating_sub(2) as usize)
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, Style::default().fg(Color::Green))))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .title(Line::from(vec![
+                    Span::styled(" activity skyline ", title_style()),
+                    Span::styled("recent ambient agent activity ", dim()),
+                ]))
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
 }
 
 fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'static> {
@@ -920,7 +1059,7 @@ fn status_style(status: SessionStatus) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentKind, AgentSession};
+    use crate::model::{AgentKind, AgentSession, ProcessStats};
 
     #[test]
     fn tail_up_down_changes_selected_session_and_resets_scroll() {
@@ -985,6 +1124,48 @@ mod tests {
         assert!(text.contains("kill 4242"));
     }
 
+    #[test]
+    fn skyline_rolls_scores_and_discards_oldest_columns() {
+        let mut skyline = ActivitySkyline::new(3);
+
+        skyline.push_score(1);
+        skyline.push_score(2);
+        skyline.push_score(3);
+        skyline.push_score(4);
+
+        assert_eq!(skyline.scores(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn skyline_turns_activity_scores_into_dot_grid() {
+        let mut skyline = ActivitySkyline::new(8);
+        skyline.push_score(0);
+        skyline.push_score(2);
+        skyline.push_score(4);
+
+        let rows = skyline_rows(&skyline, 3, 3);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], "  .");
+        assert_eq!(rows[1], " .:");
+        assert_eq!(rows[2], " .:");
+    }
+
+    #[test]
+    fn snapshot_activity_score_uses_live_process_and_recent_updates() {
+        let mut session = test_session("live", SessionStatus::Running, "/repo", 40);
+        session.process = Some(ProcessStats {
+            cpu_percent: 35,
+            memory_bytes: 128 * 1024 * 1024,
+            child_pids: vec![1, 2],
+        });
+        session.tokens_total = Some(10_000);
+
+        let score = activity_score(&[session], SystemTime::UNIX_EPOCH + Duration::from_secs(45));
+
+        assert!(score >= 8);
+    }
+
     fn tail_scroll(mode: &ViewMode) -> Option<usize> {
         match mode {
             ViewMode::Tail { scroll } => Some(*scroll),
@@ -998,5 +1179,29 @@ mod tests {
             .flat_map(|line| line.spans.into_iter().map(|span| span.content.to_string()))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn test_session(id: &str, status: SessionStatus, cwd: &str, updated_at: u64) -> AgentSession {
+        AgentSession {
+            agent: AgentKind::Codex,
+            native_id: Some(id.to_string()),
+            title: None,
+            command: Some("codex".to_string()),
+            cwd: cwd.into(),
+            pid: if status == SessionStatus::Running {
+                Some(123)
+            } else {
+                None
+            },
+            status,
+            started_at: None,
+            updated_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(updated_at)),
+            model: None,
+            tokens_total: None,
+            git_branch: None,
+            journal_path: None,
+            process: None,
+            git: None,
+        }
     }
 }
