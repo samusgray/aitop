@@ -2,8 +2,8 @@ use std::{fs, path::Path};
 
 use aitop::{
     app::{
-        AmbientSnapshot, SessionFilter, merge_sessions, policy_for_missing_processes,
-        visible_sessions,
+        AmbientSnapshot, SessionFilter, demo_snapshot, merge_sessions,
+        policy_for_missing_processes, visible_sessions,
     },
     codex::{read_process_manager, read_threads_from_db},
     git::project_name,
@@ -379,6 +379,28 @@ fn all_sessions_dedupes_inactive_rows_by_project() {
             .iter()
             .any(|session| session.native_id.as_deref() == Some("other"))
     );
+}
+
+#[test]
+fn demo_snapshots_change_over_time() {
+    let first = demo_snapshot(0);
+    let later = demo_snapshot(7);
+
+    assert!(first.sessions.len() >= 5);
+    assert!(first.sessions.iter().all(|session| session.pid.is_some()));
+    assert_ne!(
+        first
+            .sessions
+            .iter()
+            .filter_map(|session| session.tokens_total)
+            .collect::<Vec<_>>(),
+        later
+            .sessions
+            .iter()
+            .filter_map(|session| session.tokens_total)
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(first.activity, later.activity);
 }
 
 fn test_session(id: &str, status: SessionStatus, cwd: &str, updated_at: u64) -> AgentSession {

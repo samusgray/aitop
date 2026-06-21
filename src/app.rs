@@ -1,11 +1,14 @@
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Result;
 
 use crate::{
     codex,
     git::status_for_cwd,
-    model::{AgentKind, AgentSession, GitStatus, SessionStatus},
+    model::{AgentKind, AgentSession, DirtyFile, GitStatus, ProcessStats, SessionStatus},
     process::ProcessSampler,
     sources::claude,
 };
@@ -128,6 +131,128 @@ fn git_root_key(git: &GitStatus) -> String {
 pub fn snapshot() -> Result<AmbientSnapshot> {
     let mut sampler = ProcessSampler::new();
     snapshot_with_sampler(&mut sampler)
+}
+
+pub fn demo_snapshot(tick: u64) -> AmbientSnapshot {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_021_000 + tick);
+    let specs = [
+        ("api-gateway", AgentKind::Claude, "claude", 31_u32, 620_i64),
+        ("web-dashboard", AgentKind::Claude, "claude", 57, 340),
+        ("migration-runner", AgentKind::Codex, "codex", 13, 90),
+        ("auth-service", AgentKind::Claude, "claude", 82, 1180),
+        ("billing-worker", AgentKind::Codex, "codex", 4, 740),
+        ("search-index", AgentKind::Claude, "claude", 26, 410),
+    ];
+    let mut sessions = specs
+        .iter()
+        .enumerate()
+        .map(|(index, (repo, agent, command, cpu_seed, token_seed))| {
+            let wave = ((tick + index as u64 * 3) % 18) as u32;
+            let spike = matches!((tick + index as u64) % 13, 0 | 1);
+            let cpu = if spike {
+                70 + wave.min(25)
+            } else {
+                (cpu_seed + wave * 3) % 45
+            };
+            let tokens = token_seed + (tick as i64 * (index as i64 + 2) * 137);
+            let dirty_count = if spike {
+                3
+            } else {
+                (tick as usize + index) % 3
+            };
+            let dirty_files = (0..dirty_count)
+                .map(|file_index| DirtyFile {
+                    code: if file_index == 0 { "M" } else { "??" }.to_string(),
+                    path: format!("src/{repo}/file-{file_index}.rs"),
+                })
+                .collect::<Vec<_>>();
+            AgentSession {
+                agent: *agent,
+                native_id: Some(format!("demo-{repo}")),
+                title: Some(repo.to_string()),
+                command: Some((*command).to_string()),
+                cwd: format!("/demo/{repo}").into(),
+                pid: Some(40_000 + index as u32),
+                status: if tick % 23 == index as u64 {
+                    SessionStatus::Recent
+                } else {
+                    SessionStatus::Running
+                },
+                started_at: Some(now - Duration::from_secs(90 + index as u64 * 41 + tick)),
+                updated_at: Some(
+                    now - Duration::from_secs(((index as u64 * 7 + tick) % 20).min(19)),
+                ),
+                model: Some(if *agent == AgentKind::Claude {
+                    "claude-opus-4.8".to_string()
+                } else {
+                    "gpt-5.5".to_string()
+                }),
+                tokens_total: Some(tokens),
+                git_branch: Some("demo/main".to_string()),
+                journal_path: None,
+                process: Some(ProcessStats {
+                    cpu_percent: cpu,
+                    memory_bytes: (160 + (wave as u64 * 18) + index as u64 * 31) * 1024 * 1024,
+                    child_pids: (0..(1 + (wave as usize % 4)))
+                        .map(|child| 50_000 + index as u32 * 10 + child as u32)
+                        .collect(),
+                }),
+                git: Some(GitStatus {
+                    root: format!("/demo/{repo}").into(),
+                    branch: Some("demo/main".to_string()),
+                    dirty_files,
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    sessions.sort_by(|a, b| {
+        b.status
+            .eq(&SessionStatus::Running)
+            .cmp(&a.status.eq(&SessionStatus::Running))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    let activity = demo_activity(&sessions, tick);
+    AmbientSnapshot {
+        sessions,
+        generated_at: now,
+        activity,
+    }
+}
+
+fn demo_activity(sessions: &[AgentSession], tick: u64) -> Vec<String> {
+    sessions
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(index, session)| {
+            let cpu = session
+                .process
+                .as_ref()
+                .map(|process| process.cpu_percent)
+                .unwrap_or(0);
+            if (tick + index as u64).is_multiple_of(4) {
+                format!(
+                    "{} changed M src/{}/file-{}.rs",
+                    crate::model::time_label(session.updated_at),
+                    session.repo_name(),
+                    tick % 5
+                )
+            } else {
+                format!(
+                    "{} sampled cpu {}% mem {} - {}",
+                    crate::model::time_label(session.updated_at),
+                    cpu,
+                    session
+                        .process
+                        .as_ref()
+                        .map(|process| format_bytes(process.memory_bytes))
+                        .unwrap_or_else(|| "-".to_string()),
+                    session.agent
+                )
+            }
+        })
+        .collect()
 }
 
 pub fn snapshot_with_sampler(sampler: &mut ProcessSampler) -> Result<AmbientSnapshot> {

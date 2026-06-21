@@ -1,7 +1,9 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io,
-    time::{Duration, Instant, SystemTime},
+    sync::mpsc,
+    thread,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::Result;
@@ -21,7 +23,10 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AmbientSnapshot, SessionFilter, format_bytes, snapshot_with_sampler, visible_sessions},
+    app::{
+        AmbientSnapshot, SessionFilter, demo_snapshot, format_bytes, snapshot_with_sampler,
+        visible_sessions,
+    },
     feed::{FeedEvent, FeedRecord, SessionFeed, annotation_summary, load_session_feed},
     model::{AgentSession, SessionStatus, elapsed_label, path_home_display, time_label},
     pricing::{compact_tokens, short_model},
@@ -30,6 +35,12 @@ use crate::{
 
 const INPUT_TICK: Duration = Duration::from_millis(75);
 const REFRESH_TICK: Duration = Duration::from_millis(1000);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardSource {
+    Native,
+    Demo,
+}
 
 enum ViewMode {
     Monitor,
@@ -42,66 +53,234 @@ enum KeyAction {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityTone {
+    Quiet,
+    Low,
+    Medium,
+    High,
+    Hot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivitySample {
+    score: u32,
+    tone: ActivityTone,
+}
+
+impl ActivitySample {
+    fn new(score: u32, tone: ActivityTone) -> Self {
+        Self { score, tone }
+    }
+
+    #[cfg(test)]
+    fn quiet() -> Self {
+        Self::new(0, ActivityTone::Quiet)
+    }
+}
+
 struct ActivitySkyline {
-    scores: VecDeque<u32>,
+    samples: VecDeque<ActivitySample>,
     capacity: usize,
 }
 
 impl ActivitySkyline {
     fn new(capacity: usize) -> Self {
         Self {
-            scores: VecDeque::with_capacity(capacity),
+            samples: VecDeque::with_capacity(capacity),
             capacity,
         }
     }
 
-    fn push_snapshot(&mut self, snapshot: &AmbientSnapshot) {
-        self.push_score(activity_score(&snapshot.sessions, snapshot.generated_at));
+    fn push_snapshot(&mut self, snapshot: &AmbientSnapshot, scorer: &mut ActivityScorer) {
+        self.push_sample(scorer.score(snapshot));
     }
 
-    fn push_score(&mut self, score: u32) {
-        if self.scores.len() == self.capacity {
-            self.scores.pop_front();
+    fn push_sample(&mut self, sample: ActivitySample) {
+        if self.samples.len() == self.capacity {
+            self.samples.pop_front();
         }
-        self.scores.push_back(score);
+        self.samples.push_back(sample);
+    }
+
+    #[cfg(test)]
+    fn push_score(&mut self, score: u32) {
+        self.push_sample(ActivitySample::new(score, tone_for_score(score)));
     }
 
     #[cfg(test)]
     fn scores(&self) -> Vec<u32> {
-        self.scores.iter().copied().collect()
+        self.samples.iter().map(|sample| sample.score).collect()
     }
 }
 
-pub fn run() -> Result<()> {
+#[derive(Debug, Clone, Default)]
+struct ActivityScorer {
+    previous: BTreeMap<String, SessionObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionObservation {
+    status: SessionStatus,
+    cpu_percent: u32,
+    tokens_total: i64,
+    dirty_count: usize,
+    updated_at: Option<SystemTime>,
+}
+
+impl ActivityScorer {
+    fn score(&mut self, snapshot: &AmbientSnapshot) -> ActivitySample {
+        let current = snapshot
+            .sessions
+            .iter()
+            .map(|session| (session_key(session), observe_session(session)))
+            .collect::<BTreeMap<_, _>>();
+        let mut score = 0;
+        let mut hot = false;
+
+        for (key, observation) in &current {
+            match self.previous.get(key) {
+                Some(previous) => {
+                    let cpu_delta = observation.cpu_percent.abs_diff(previous.cpu_percent);
+                    if cpu_delta >= 60 {
+                        hot = true;
+                    }
+                    score += (cpu_delta / 10).min(8);
+
+                    let token_delta = observation
+                        .tokens_total
+                        .saturating_sub(previous.tokens_total)
+                        .max(0) as u32;
+                    score += (token_delta / 2_000).min(10);
+                    if token_delta >= 10_000 {
+                        hot = true;
+                    }
+
+                    if observation.updated_at != previous.updated_at {
+                        score += 3;
+                    }
+                    if observation.dirty_count != previous.dirty_count {
+                        score += 4 + observation.dirty_count.abs_diff(previous.dirty_count) as u32;
+                    }
+                    if observation.status != previous.status {
+                        score += 6;
+                    }
+                }
+                None => {
+                    score += if observation.status == SessionStatus::Running {
+                        4
+                    } else {
+                        1
+                    };
+                }
+            }
+        }
+
+        for key in self.previous.keys() {
+            if !current.contains_key(key) {
+                score += 6;
+            }
+        }
+
+        if snapshot
+            .activity
+            .iter()
+            .any(|line| line.contains("changed"))
+        {
+            score += 2;
+        }
+
+        self.previous = current;
+        let score = score.min(100);
+        let tone = if hot {
+            ActivityTone::Hot
+        } else {
+            tone_for_score(score)
+        };
+        ActivitySample::new(score, tone)
+    }
+}
+
+fn observe_session(session: &AgentSession) -> SessionObservation {
+    SessionObservation {
+        status: session.status,
+        cpu_percent: session
+            .process
+            .as_ref()
+            .map(|process| process.cpu_percent)
+            .unwrap_or(0),
+        tokens_total: session.tokens_total.unwrap_or(0),
+        dirty_count: session.dirty_count(),
+        updated_at: session.updated_at,
+    }
+}
+
+fn session_key(session: &AgentSession) -> String {
+    session.native_id.clone().unwrap_or_else(|| {
+        format!(
+            "{}:{}:{}",
+            session.agent,
+            session.cwd.display(),
+            session.pid.unwrap_or_default()
+        )
+    })
+}
+
+fn tone_for_score(score: u32) -> ActivityTone {
+    match score {
+        0 => ActivityTone::Quiet,
+        1..=3 => ActivityTone::Low,
+        4..=8 => ActivityTone::Medium,
+        9..=15 => ActivityTone::High,
+        _ => ActivityTone::Hot,
+    }
+}
+
+pub fn run(source: DashboardSource) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_loop(&mut terminal);
+    let result = run_loop(&mut terminal, source);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
     result
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    source: DashboardSource,
+) -> Result<()> {
     let mut selected = 0usize;
     let mut mode = ViewMode::Monitor;
     let mut filter = SessionFilter::Active;
+    let (snapshot_tx, snapshot_rx) = mpsc::channel();
+    spawn_snapshot_worker(source, snapshot_tx);
     let mut sampler = ProcessSampler::new();
-    let mut snapshot = snapshot_with_sampler(&mut sampler)?;
+    let mut snapshot = snapshot_for_source(source, 0, &mut sampler)?;
     let mut skyline = ActivitySkyline::new(160);
-    skyline.push_snapshot(&snapshot);
-    let mut last_refresh = Instant::now();
+    let mut scorer = ActivityScorer::default();
+    skyline.push_snapshot(&snapshot, &mut scorer);
+    let mut needs_draw = true;
 
     loop {
+        while let Ok(next_snapshot) = snapshot_rx.try_recv() {
+            snapshot = next_snapshot;
+            skyline.push_snapshot(&snapshot, &mut scorer);
+            needs_draw = true;
+        }
+
         let sessions = visible_sessions(&snapshot.sessions, filter);
         selected = clamp_selected(selected, sessions.len());
-        terminal.draw(|frame| {
-            draw(
-                frame, &snapshot, &sessions, selected, &mode, filter, &skyline,
-            )
-        })?;
+        if needs_draw {
+            terminal.draw(|frame| {
+                draw(
+                    frame, &snapshot, &sessions, selected, &mode, filter, &skyline,
+                )
+            })?;
+            needs_draw = false;
+        }
 
         if event::poll(INPUT_TICK)?
             && let Event::Key(key) = event::read()?
@@ -115,19 +294,44 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
             ) {
                 KeyAction::Quit => return Ok(()),
                 KeyAction::Refresh => {
-                    snapshot = snapshot_with_sampler(&mut sampler)?;
-                    skyline.push_snapshot(&snapshot);
-                    last_refresh = Instant::now();
+                    snapshot = snapshot_for_source(
+                        source,
+                        skyline.samples.len() as u64 + 1,
+                        &mut sampler,
+                    )?;
+                    skyline.push_snapshot(&snapshot, &mut scorer);
+                    needs_draw = true;
                 }
-                KeyAction::Continue => {}
+                KeyAction::Continue => needs_draw = true,
             }
         }
+    }
+}
 
-        if last_refresh.elapsed() >= REFRESH_TICK {
-            snapshot = snapshot_with_sampler(&mut sampler)?;
-            skyline.push_snapshot(&snapshot);
-            last_refresh = Instant::now();
+fn spawn_snapshot_worker(source: DashboardSource, tx: mpsc::Sender<AmbientSnapshot>) {
+    thread::spawn(move || {
+        let mut tick = 1_u64;
+        let mut sampler = ProcessSampler::new();
+        loop {
+            thread::sleep(REFRESH_TICK);
+            if let Ok(snapshot) = snapshot_for_source(source, tick, &mut sampler)
+                && tx.send(snapshot).is_err()
+            {
+                break;
+            }
+            tick += 1;
         }
+    });
+}
+
+fn snapshot_for_source(
+    source: DashboardSource,
+    tick: u64,
+    sampler: &mut ProcessSampler,
+) -> Result<AmbientSnapshot> {
+    match source {
+        DashboardSource::Native => snapshot_with_sampler(sampler),
+        DashboardSource::Demo => Ok(demo_snapshot(tick)),
     }
 }
 
@@ -217,77 +421,96 @@ fn draw(
     }
 }
 
-fn activity_score(sessions: &[AgentSession], now: SystemTime) -> u32 {
-    sessions
-        .iter()
-        .map(|session| session_activity_score(session, now))
-        .sum::<u32>()
-        .min(100)
-}
-
-fn session_activity_score(session: &AgentSession, now: SystemTime) -> u32 {
-    let mut score = 0;
-    if session.status == SessionStatus::Running {
-        score += 3;
-    }
-    if let Some(process) = &session.process {
-        score += (process.cpu_percent / 10).min(6);
-        score += (process.memory_bytes / (256 * 1024 * 1024)).min(4) as u32;
-        score += process.child_pids.len().min(3) as u32;
-    }
-    if let Some(updated_at) = session.updated_at
-        && now
-            .duration_since(updated_at)
-            .map(|duration| duration <= Duration::from_secs(60))
-            .unwrap_or(false)
-    {
-        score += 2;
-    }
-    if session.tokens_total.unwrap_or(0) > 0 {
-        score += 1;
-    }
-    score += session.dirty_count().min(3) as u32;
-    score
-}
-
+#[cfg(test)]
 fn skyline_rows(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<String> {
-    let mut values = skyline
-        .scores
+    let columns = skyline_columns(skyline, width, height);
+    (0..height)
+        .map(|row| columns.iter().map(|column| column.cells[row]).collect())
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkylineColumn {
+    cells: Vec<char>,
+    tone: ActivityTone,
+}
+
+fn skyline_columns(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<SkylineColumn> {
+    let mut samples = skyline
+        .samples
         .iter()
         .rev()
         .take(width)
         .copied()
         .collect::<Vec<_>>();
-    values.reverse();
-    let max_score = values.iter().copied().max().unwrap_or(1).max(1);
+    samples.reverse();
+    let max_score = samples
+        .iter()
+        .map(|sample| sample.score)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut columns = Vec::with_capacity(width);
+    if samples.len() < width {
+        columns.extend((0..(width - samples.len())).map(|_| SkylineColumn {
+            cells: vec![' '; height],
+            tone: ActivityTone::Quiet,
+        }));
+    }
+
+    for sample in samples {
+        let level = if sample.score == 0 {
+            0
+        } else {
+            (sample.score as usize * height).div_ceil(max_score as usize)
+        };
+        let dot = dot_for_tone(sample.tone);
+        let cells = (0..height)
+            .map(|row| if height - row <= level { dot } else { ' ' })
+            .collect::<Vec<_>>();
+        columns.push(SkylineColumn {
+            cells,
+            tone: sample.tone,
+        });
+    }
+    columns
+}
+
+fn skyline_lines(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<Line<'static>> {
+    let columns = skyline_columns(skyline, width, height);
     let mut rows = Vec::with_capacity(height);
 
     for row in 0..height {
-        let threshold = height - row;
-        let mut line = String::with_capacity(width);
-        for score in &values {
-            if *score == 0 {
-                line.push(' ');
-                continue;
-            }
-            let level = (*score as usize * height).div_ceil(max_score as usize);
-            if level >= threshold {
-                let dot = if *score == max_score && threshold < height {
-                    ':'
-                } else {
-                    '.'
-                };
-                line.push(dot);
-            } else {
-                line.push(' ');
-            }
+        let mut spans = Vec::with_capacity(columns.len());
+        for column in &columns {
+            spans.push(Span::styled(
+                column.cells[row].to_string(),
+                Style::default().fg(color_for_tone(column.tone)),
+            ));
         }
-        if line.len() < width {
-            line = format!("{}{}", " ".repeat(width - line.len()), line);
-        }
-        rows.push(line);
+        rows.push(Line::from(spans));
     }
     rows
+}
+
+fn dot_for_tone(tone: ActivityTone) -> char {
+    match tone {
+        ActivityTone::Quiet => ' ',
+        ActivityTone::Low => '.',
+        ActivityTone::Medium => ':',
+        ActivityTone::High => '*',
+        ActivityTone::Hot => '#',
+    }
+}
+
+fn color_for_tone(tone: ActivityTone) -> Color {
+    match tone {
+        ActivityTone::Quiet => Color::DarkGray,
+        ActivityTone::Low => Color::Rgb(80, 150, 100),
+        ActivityTone::Medium => Color::Green,
+        ActivityTone::High => Color::Yellow,
+        ActivityTone::Hot => Color::Red,
+    }
 }
 
 fn draw_monitor(
@@ -337,10 +560,7 @@ fn draw_monitor(
 fn render_skyline(frame: &mut Frame<'_>, skyline: &ActivitySkyline, area: Rect) {
     frame.render_widget(Clear, area);
     let inner_width = area.width.saturating_sub(4) as usize;
-    let rows = skyline_rows(skyline, inner_width, area.height.saturating_sub(2) as usize)
-        .into_iter()
-        .map(|row| Line::from(Span::styled(row, Style::default().fg(Color::Green))))
-        .collect::<Vec<_>>();
+    let rows = skyline_lines(skyline, inner_width, area.height.saturating_sub(2) as usize);
     frame.render_widget(
         Paragraph::new(rows).block(
             Block::default()
@@ -1139,31 +1359,81 @@ mod tests {
     #[test]
     fn skyline_turns_activity_scores_into_dot_grid() {
         let mut skyline = ActivitySkyline::new(8);
-        skyline.push_score(0);
-        skyline.push_score(2);
-        skyline.push_score(4);
+        skyline.push_sample(ActivitySample::quiet());
+        skyline.push_sample(ActivitySample::new(2, ActivityTone::Low));
+        skyline.push_sample(ActivitySample::new(4, ActivityTone::Medium));
 
         let rows = skyline_rows(&skyline, 3, 3);
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], "  .");
+        assert_eq!(rows[0], "  :");
         assert_eq!(rows[1], " .:");
         assert_eq!(rows[2], " .:");
     }
 
     #[test]
-    fn snapshot_activity_score_uses_live_process_and_recent_updates() {
+    fn skyline_scores_deltas_not_static_load() {
         let mut session = test_session("live", SessionStatus::Running, "/repo", 40);
         session.process = Some(ProcessStats {
-            cpu_percent: 35,
+            cpu_percent: 10,
             memory_bytes: 128 * 1024 * 1024,
-            child_pids: vec![1, 2],
+            child_pids: vec![1],
         });
         session.tokens_total = Some(10_000);
 
-        let score = activity_score(&[session], SystemTime::UNIX_EPOCH + Duration::from_secs(45));
+        let first = AmbientSnapshot {
+            sessions: vec![session.clone()],
+            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(45),
+            activity: vec![],
+        };
+        let unchanged = AmbientSnapshot {
+            sessions: vec![session.clone()],
+            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(46),
+            activity: vec![],
+        };
+        session.process.as_mut().unwrap().cpu_percent = 80;
+        session.tokens_total = Some(16_000);
+        session.updated_at = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(47));
+        let changed = AmbientSnapshot {
+            sessions: vec![session],
+            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(47),
+            activity: vec!["changed M src/lib.rs".to_string()],
+        };
 
-        assert!(score >= 8);
+        let mut scorer = ActivityScorer::default();
+
+        let warmup = scorer.score(&first);
+        let quiet = scorer.score(&unchanged);
+        let active = scorer.score(&changed);
+
+        assert!(warmup.score > 0);
+        assert_eq!(quiet.score, 0);
+        assert!(active.score > quiet.score);
+        assert!(matches!(
+            active.tone,
+            ActivityTone::High | ActivityTone::Hot
+        ));
+    }
+
+    #[test]
+    fn skyline_render_preserves_tone_for_colored_columns() {
+        let mut skyline = ActivitySkyline::new(8);
+        skyline.push_sample(ActivitySample::new(1, ActivityTone::Low));
+        skyline.push_sample(ActivitySample::new(5, ActivityTone::Medium));
+        skyline.push_sample(ActivitySample::new(9, ActivityTone::High));
+        skyline.push_sample(ActivitySample::new(14, ActivityTone::Hot));
+
+        let columns = skyline_columns(&skyline, 4, 3);
+
+        assert_eq!(
+            columns.iter().map(|column| column.tone).collect::<Vec<_>>(),
+            vec![
+                ActivityTone::Low,
+                ActivityTone::Medium,
+                ActivityTone::High,
+                ActivityTone::Hot
+            ]
+        );
     }
 
     fn tail_scroll(mode: &ViewMode) -> Option<usize> {
