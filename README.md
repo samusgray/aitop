@@ -78,6 +78,7 @@ Monitor view:
 - `up` / `down` or `j` / `k`: select a session
 - `enter`: open the focused tail view
 - `s`: open the stream view (cross-project activity preview)
+- `v`: toggle top panel (graph/timeline)
 - `a`: cycle overview, active, and all views
 - `r`: refresh
 - `q`: quit

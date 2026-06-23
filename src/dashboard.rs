@@ -61,6 +61,21 @@ enum KeyAction {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopPanel {
+    Throughput,
+    Swimlane,
+}
+
+impl TopPanel {
+    fn next(self) -> Self {
+        match self {
+            TopPanel::Throughput => TopPanel::Swimlane,
+            TopPanel::Swimlane => TopPanel::Throughput,
+        }
+    }
+}
+
 pub fn run(source: DashboardSource) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -80,6 +95,7 @@ fn run_loop(
     let mut selected = 0usize;
     let mut mode = ViewMode::Monitor;
     let mut filter = SessionFilter::Overview;
+    let mut top_panel = TopPanel::Throughput;
     let (snapshot_tx, snapshot_rx) = mpsc::channel();
     spawn_snapshot_worker(source, snapshot_tx);
     let mut sampler = ProcessSampler::new();
@@ -116,6 +132,7 @@ fn run_loop(
                         last_feed_offset: &last_feed_offset,
                         last_stream_scroll: &last_stream_scroll,
                         activity_index: &activity_index,
+                        top_panel,
                     },
                 )
             })?;
@@ -125,6 +142,14 @@ fn run_loop(
         if event::poll(INPUT_TICK)?
             && let Event::Key(key) = event::read()?
         {
+            // 'v' toggles the top panel (throughput graph ↔ swimlane) in monitor mode only.
+            // Handled here rather than inside handle_key to avoid adding yet another parameter
+            // to an already-large signature; run_loop owns top_panel so this is the natural site.
+            if matches!(mode, ViewMode::Monitor) && key.code == KeyCode::Char('v') {
+                top_panel = top_panel.next();
+                needs_draw = true;
+                continue;
+            }
             let stream_projects = distinct_projects(activity_index.events());
             let stream_filtered_len =
                 if let ViewMode::Stream { ref project_filter, errors_only, .. } = mode {
@@ -410,6 +435,7 @@ struct DrawContext<'a> {
     last_feed_offset: &'a std::cell::Cell<usize>,
     last_stream_scroll: &'a std::cell::Cell<usize>,
     activity_index: &'a crate::activity::ActivityIndex,
+    top_panel: TopPanel,
 }
 
 fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
@@ -424,6 +450,7 @@ fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
             context.filter,
             context.history,
             context.activity_index,
+            context.top_panel,
         ),
         ViewMode::Tail { scroll, follow } => draw_tail(
             frame,
@@ -457,6 +484,7 @@ fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_monitor(
     frame: &mut Frame<'_>,
     snapshot: &AmbientSnapshot,
@@ -465,6 +493,7 @@ fn draw_monitor(
     filter: SessionFilter,
     history: &crate::metrics::MetricsHistory,
     activity_index: &crate::activity::ActivityIndex,
+    top_panel: TopPanel,
 ) {
     let compact = frame.area().height < 32;
     let panel_height = if compact { 5 } else { 7 };
@@ -483,7 +512,10 @@ fn draw_monitor(
 
     frame.render_widget(Clear, vertical[0]);
     frame.render_widget(header(snapshot, filter), vertical[0]);
-    render_throughput(frame, history, vertical[1]);
+    match top_panel {
+        TopPanel::Throughput => render_throughput(frame, history, vertical[1]),
+        TopPanel::Swimlane => render_swimlane(frame, history, vertical[1]),
+    }
     render_heat_ribbon(frame, history, vertical[2]);
 
     let main = Layout::default()
@@ -1137,6 +1169,8 @@ fn monitor_footer() -> Paragraph<'static> {
         Span::raw(" tail   "),
         Span::styled("s", key_style()),
         Span::raw(" stream   "),
+        Span::styled("v", key_style()),
+        Span::raw(" panel   "),
         Span::styled("r", key_style()),
         Span::raw(" refresh   "),
         Span::styled("a", key_style()),
@@ -1847,6 +1881,12 @@ mod tests {
         key: KeyCode,
     ) -> KeyAction {
         handle_key(mode, selected, filter, session_count, last_offset, key, 0, &[], 0)
+    }
+
+    #[test]
+    fn top_panel_toggles() {
+        assert_eq!(super::TopPanel::Throughput.next(), super::TopPanel::Swimlane);
+        assert_eq!(super::TopPanel::Swimlane.next(), super::TopPanel::Throughput);
     }
 
     #[test]
