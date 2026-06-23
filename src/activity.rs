@@ -1,9 +1,8 @@
 use std::time::SystemTime;
 
-use crate::feed::{FeedEvent, FeedRecord, FileEditHunk};
+use crate::feed::{FeedEvent, FeedRecord, FileEditHunk, sanitize_inline, truncate_summary};
 use crate::model::AgentKind;
 use crate::pricing::compact_tokens;
-use crate::feed::{sanitize_inline, truncate_summary};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamKind {
@@ -92,13 +91,13 @@ pub fn event_from_record(
         ),
         FeedEvent::Usage { input, output, .. } => (
             StreamKind::Usage,
-            format!("{} in {} out", compact_tokens(*input), compact_tokens(*output)),
+            sanitize_inline(&format!("{} in {} out", compact_tokens(*input), compact_tokens(*output))),
             None,
             annotations_has_error,
         ),
         FeedEvent::Unknown { kind } => (
             StreamKind::Result,
-            format!("? {kind}"),
+            sanitize_inline(&format!("? {kind}")),
             None,
             annotations_has_error,
         ),
