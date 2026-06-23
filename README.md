@@ -17,6 +17,7 @@
 - Hides stale missing-path sessions from the default overview.
 - Shows repo, branch, dirty files, PID, CPU, memory, model, token totals, and recent activity where available.
 - Provides a focused tail view with normalized user, assistant, thinking, tool, result, and usage events.
+- In the tail view, code edits render as inline syntax-highlighted diffs with line numbers.
 
 ## Install
 
@@ -80,12 +81,14 @@ Monitor view:
 - `r`: refresh
 - `q`: quit
 
-Tail view:
+Tail view (opens at bottom and follows new events):
 
-- `j` / `k`: scroll the focused log feed
-- `up` / `down`: select another session
-- `page up` / `page down`: scroll by larger jumps
-- `g` / `G`: jump toward top or bottom
+- `j`: scroll down (only when not following)
+- `k`: scroll up (freezes auto-follow)
+- `page up` / `page down`: scroll by larger jumps (freeze auto-follow)
+- `g`: jump to top (frozen)
+- `G`: jump to bottom and resume auto-follow
+- `up` / `down`: select another session (resets to auto-follow)
 - `esc`: return to monitor
 - `a`: return to monitor and cycle views
 - `q`: quit
