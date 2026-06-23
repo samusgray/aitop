@@ -95,7 +95,9 @@ pub fn diff_hunk(old: &str, new: &str) -> Vec<DiffLine> {
 
             let mut segs = Vec::new();
             for (emphasized, value) in change.iter_strings_lossy() {
-                let text = value.trim_end_matches(['\r', '\n']).to_string();
+                // Drop interior control chars / ANSI as well as the trailing
+                // newline so a diff line can never corrupt terminal rendering.
+                let text = crate::feed::sanitize_inline(&value);
                 if !text.is_empty() {
                     segs.push(DiffSeg { text, emphasized });
                 }

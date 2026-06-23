@@ -539,9 +539,63 @@ pub fn annotation_summary(annotations: &[Annotation]) -> String {
     parts.join(" · ")
 }
 
+/// Strip ANSI escape sequences and control characters from text destined for a
+/// single rendered line. Captured command output (e.g. `git rebase` progress,
+/// which uses `\r` to redraw "Rebasing (N/M)" in place, or colorized output with
+/// raw `\x1b[..m` codes) otherwise reaches the terminal verbatim, where the
+/// cursor jumps to column 0 and content bleeds across panes. Tabs expand to
+/// spaces; carriage returns, newlines, and other control characters are dropped.
+pub fn sanitize_inline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek() {
+                // CSI (e.g. color codes): consume through the final byte in @..~
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: consume through BEL or ESC-backslash
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Other escape forms: drop the single following byte.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if ch == '\t' {
+            out.push_str("    ");
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 pub fn truncate_detail(text: &str, max_lines: usize, max_bytes: usize) -> String {
     let mut output = String::new();
     for (index, line) in text.lines().enumerate() {
+        let line = sanitize_inline(line);
         if index >= max_lines || output.len() + line.len() > max_bytes {
             output.push('…');
             break;
@@ -549,13 +603,14 @@ pub fn truncate_detail(text: &str, max_lines: usize, max_bytes: usize) -> String
         if index > 0 {
             output.push('\n');
         }
-        output.push_str(line);
+        output.push_str(&line);
     }
     output
 }
 
 pub fn truncate_summary(text: &str, max_chars: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = sanitize_inline(text);
+    let collapsed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= max_chars {
         return collapsed;
     }
@@ -570,6 +625,32 @@ pub fn truncate_summary(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sanitize_drops_carriage_returns() {
+        // git rebase progress: "Rebasing (1/14)\rRebasing (5/14)" on one physical line.
+        assert_eq!(
+            sanitize_inline("Rebasing (1/14)\rRebasing (5/14)"),
+            "Rebasing (1/14)Rebasing (5/14)"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_ansi_escape_sequences() {
+        assert_eq!(sanitize_inline("\u{1b}[31mred\u{1b}[0m"), "red");
+    }
+
+    #[test]
+    fn sanitize_expands_tabs_and_drops_newlines() {
+        assert_eq!(sanitize_inline("a\tb\nc"), "a    bc");
+    }
+
+    #[test]
+    fn truncate_detail_strips_interior_carriage_returns() {
+        let out = truncate_detail("Rebasing (1/14)\rRebasing (2/14)\rRebasing (5/14)", 12, 2048);
+        assert!(!out.contains('\r'), "carriage returns must be removed: {out:?}");
+        assert!(out.contains("Rebasing (5/14)"));
+    }
 
     #[test]
     fn parses_edit_into_single_hunk() {

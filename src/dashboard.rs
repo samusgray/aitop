@@ -1389,8 +1389,9 @@ fn centered(text: &str) -> Line<'static> {
 }
 
 fn truncate(value: &str, max: usize) -> String {
+    let value = crate::feed::sanitize_inline(value);
     if value.chars().count() <= max {
-        return value.to_string();
+        return value;
     }
     value
         .chars()
