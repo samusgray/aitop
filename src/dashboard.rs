@@ -314,30 +314,32 @@ fn draw_monitor(
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(panel_height),
-            Constraint::Min(9),
-            Constraint::Length(activity_height),
-            Constraint::Length(2),
+            Constraint::Length(3),              // [0] header
+            Constraint::Length(panel_height),   // [1] throughput panel
+            Constraint::Length(1),              // [2] heat ribbon
+            Constraint::Min(9),                 // [3] main split
+            Constraint::Length(activity_height), // [4] activity
+            Constraint::Length(2),              // [5] footer
         ])
         .split(frame.area());
 
     frame.render_widget(Clear, vertical[0]);
     frame.render_widget(header(snapshot, filter), vertical[0]);
     render_throughput(frame, history, vertical[1]);
+    render_heat_ribbon(frame, history, vertical[2]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(61), Constraint::Percentage(39)])
-        .split(vertical[2]);
+        .split(vertical[3]);
 
     frame.render_widget(Clear, main[0]);
     frame.render_widget(session_table(snapshot, sessions, selected, filter), main[0]);
     frame.render_widget(Clear, main[1]);
     frame.render_widget(session_detail(sessions.get(selected)), main[1]);
-    render_activity(frame, snapshot, vertical[3]);
-    frame.render_widget(Clear, vertical[4]);
-    frame.render_widget(monitor_footer(), vertical[4]);
+    render_activity(frame, snapshot, vertical[4]);
+    frame.render_widget(Clear, vertical[5]);
+    frame.render_widget(monitor_footer(), vertical[5]);
 
     if sessions.is_empty() {
         draw_empty_state(frame, main[0]);
@@ -436,6 +438,95 @@ fn render_throughput(frame: &mut Frame<'_>, history: &crate::metrics::MetricsHis
             }),
         canvas_area,
     );
+}
+
+pub fn render_heat_ribbon(frame: &mut Frame<'_>, history: &crate::metrics::MetricsHistory, area: Rect) {
+    frame.render_widget(Clear, area);
+
+    let width = area.width as usize;
+    if width == 0 {
+        return;
+    }
+
+    let projects = history.projects();
+    if projects.is_empty() {
+        return;
+    }
+
+    let max_heat = projects
+        .iter()
+        .map(|p| p.tokens_per_min)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+
+    let heat_glyph = "●";
+    let total = projects.len();
+
+    // Determine how many cells fit in `width`.
+    let mut used = 0usize;
+    let mut fit = 0usize;
+
+    for (i, project) in projects.iter().enumerate() {
+        let cell_w = project.project.chars().count() + heat_glyph.chars().count();
+        let sep_w = if i > 0 { 1 } else { 0 };
+        // If there are more cells after this one, reserve room for the "+N" suffix.
+        let remaining_after = total - i - 1;
+        let overflow_reserve = if remaining_after > 0 {
+            1 + format!("+{remaining_after}").len() // " +N"
+        } else {
+            0
+        };
+
+        if used + sep_w + cell_w + overflow_reserve > width {
+            break;
+        }
+
+        used += sep_w + cell_w;
+        fit += 1;
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    for (i, project) in projects.iter().take(fit).enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let norm = if project.tokens_per_min <= 0.0 {
+            0.0
+        } else {
+            project.tokens_per_min / max_heat
+        };
+        let (fg, bg) = ribbon_heat_color(norm);
+        spans.push(Span::styled(
+            format!("{}{heat_glyph}", project.project),
+            Style::default().fg(fg).bg(bg),
+        ));
+    }
+
+    let overflow = total - fit;
+    if overflow > 0 {
+        if fit > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            format!("+{overflow}"),
+            dim(),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn ribbon_heat_color(norm: f64) -> (Color, Color) {
+    if norm <= 0.0 {
+        (Color::DarkGray, Color::Reset)
+    } else if norm < 0.33 {
+        (Color::White, Color::Rgb(20, 20, 60))
+    } else if norm < 0.66 {
+        (Color::White, Color::Rgb(60, 40, 0))
+    } else {
+        (Color::White, Color::Rgb(100, 30, 0))
+    }
 }
 
 fn throughput_burn_rate_hr(cost_series: &[f64]) -> Option<f64> {
@@ -1441,6 +1532,18 @@ mod tests {
         handle_key(&mut mode, &mut selected, &mut filter, 3, 80, KeyCode::PageUp);
         assert_eq!(tail_scroll(&mode), Some(75));
         assert_eq!(tail_follow(&mode), Some(false));
+    }
+
+    #[test]
+    fn heat_ribbon_lists_projects() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut h = crate::metrics::MetricsHistory::new(8);
+        h.push(&super::tests_support_snapshot(0));
+        h.push(&super::tests_support_snapshot(1));
+        let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        term.draw(|f| super::render_heat_ribbon(f, &h, f.area())).unwrap();
+        let content: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("x"), "project name (cwd '/x' → repo 'x') present");
     }
 
     #[test]
