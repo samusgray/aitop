@@ -180,6 +180,29 @@ pub fn load_session_feed(
     Ok(feed)
 }
 
+pub fn tail_records(
+    path: &Path,
+    agent: AgentKind,
+    session_id: &str,
+    max_records: usize,
+) -> Vec<FeedRecord> {
+    let text = match read_tail(path, 256 * 1024) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut records: Vec<FeedRecord> = text
+        .lines()
+        .flat_map(|line| match agent {
+            AgentKind::Claude => parse_claude_line(line, session_id),
+            AgentKind::Codex => parse_codex_line(line, session_id),
+        })
+        .collect();
+    if records.len() > max_records {
+        records.drain(..records.len() - max_records);
+    }
+    records
+}
+
 pub fn parse_claude_line(line: &str, session_id: &str) -> Vec<FeedRecord> {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
@@ -689,5 +712,27 @@ mod tests {
     fn non_edit_tool_is_none() {
         let input = json!({"command": "ls"});
         assert!(parse_file_edit("Bash", &input).is_none());
+    }
+
+    #[test]
+    fn tail_records_returns_last_n_records() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..5 {
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": format!("msg {i}")}
+                })
+            )
+            .unwrap();
+        }
+        let recs = tail_records(&path, crate::model::AgentKind::Claude, "s", 2);
+        assert!(recs.len() <= 2, "respects cap, got {}", recs.len());
+        assert!(!recs.is_empty(), "parsed something");
     }
 }
