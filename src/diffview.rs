@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use ratatui::{
@@ -138,7 +141,36 @@ pub fn collapse(mut lines: Vec<DiffLine>, max: usize) -> (Vec<DiffLine>, usize) 
     (lines, hidden)
 }
 
+fn cache() -> &'static Mutex<HashMap<u64, Vec<Line<'static>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<Line<'static>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_key(path: &str, hunks: &[FileEditHunk], width: usize) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    width.hash(&mut hasher);
+    for hunk in hunks {
+        hunk.old_text.hash(&mut hasher);
+        hunk.new_text.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub fn render_file_edit(path: &str, hunks: &[FileEditHunk], width: usize) -> Vec<Line<'static>> {
+    let key = cache_key(path, hunks, width);
+    if let Some(hit) = cache().lock().expect("diff cache lock").get(&key) {
+        return hit.clone();
+    }
+    let rendered = render_file_edit_uncached(path, hunks, width);
+    cache()
+        .lock()
+        .expect("diff cache lock")
+        .insert(key, rendered.clone());
+    rendered
+}
+
+fn render_file_edit_uncached(path: &str, hunks: &[FileEditHunk], width: usize) -> Vec<Line<'static>> {
     let (syntaxes, theme) = assets();
     let syntax = syntaxes
         .find_syntax_by_extension(extension(path))
@@ -348,5 +380,23 @@ mod tests {
         let (kept, hidden) = collapse(lines, 20);
         assert_eq!(kept.len(), 20);
         assert_eq!(hidden, 5);
+    }
+
+    #[test]
+    fn render_is_stable_across_calls() {
+        let hunks = vec![FileEditHunk {
+            old_text: "a\n".to_string(),
+            new_text: "b\n".to_string(),
+        }];
+        let first = render_file_edit("src/x.rs", &hunks, 60);
+        let second = render_file_edit("src/x.rs", &hunks, 60);
+        assert_eq!(first.len(), second.len());
+        let join = |lines: &[Line<'static>]| -> String {
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect()
+        };
+        assert_eq!(join(&first), join(&second));
     }
 }
