@@ -45,7 +45,7 @@ pub enum DashboardSource {
 
 enum ViewMode {
     Monitor,
-    Tail { scroll: usize },
+    Tail { scroll: usize, follow: bool },
 }
 
 enum KeyAction {
@@ -376,19 +376,22 @@ fn handle_key(
             KeyAction::Continue
         }
         KeyCode::Enter if matches!(mode, ViewMode::Monitor) => {
-            *mode = ViewMode::Tail { scroll: 0 };
+            *mode = ViewMode::Tail { scroll: 0, follow: true };
             KeyAction::Continue
         }
         KeyCode::Char('j') => {
-            if let ViewMode::Tail { scroll } = mode {
-                *scroll = scroll.saturating_add(1);
+            if let ViewMode::Tail { scroll, follow } = mode {
+                if !*follow {
+                    *scroll = scroll.saturating_add(1);
+                }
             } else {
                 *selected = (*selected + 1).min(session_count.saturating_sub(1));
             }
             KeyAction::Continue
         }
         KeyCode::Char('k') => {
-            if let ViewMode::Tail { scroll } = mode {
+            if let ViewMode::Tail { scroll, follow } = mode {
+                *follow = false;
                 *scroll = scroll.saturating_sub(1);
             } else {
                 *selected = selected.saturating_sub(1);
@@ -397,39 +400,45 @@ fn handle_key(
         }
         KeyCode::Down => {
             *selected = (*selected + 1).min(session_count.saturating_sub(1));
-            if let ViewMode::Tail { scroll } = mode {
+            if let ViewMode::Tail { scroll, follow } = mode {
                 *scroll = 0;
+                *follow = true;
             }
             KeyAction::Continue
         }
         KeyCode::Up => {
             *selected = selected.saturating_sub(1);
-            if let ViewMode::Tail { scroll } = mode {
+            if let ViewMode::Tail { scroll, follow } = mode {
                 *scroll = 0;
+                *follow = true;
             }
             KeyAction::Continue
         }
         KeyCode::PageDown => {
-            if let ViewMode::Tail { scroll } = mode {
+            if let ViewMode::Tail { scroll, follow } = mode {
+                *follow = false;
                 *scroll = scroll.saturating_add(5);
             }
             KeyAction::Continue
         }
         KeyCode::PageUp => {
-            if let ViewMode::Tail { scroll } = mode {
+            if let ViewMode::Tail { scroll, follow } = mode {
+                *follow = false;
                 *scroll = scroll.saturating_sub(5);
             }
             KeyAction::Continue
         }
         KeyCode::Char('g') => {
-            if let ViewMode::Tail { scroll } = mode {
+            if let ViewMode::Tail { scroll, follow } = mode {
+                *follow = false;
                 *scroll = 0;
             }
             KeyAction::Continue
         }
         KeyCode::Char('G') => {
-            if let ViewMode::Tail { scroll } = mode {
-                *scroll = usize::MAX;
+            if let ViewMode::Tail { scroll, follow } = mode {
+                *follow = true;
+                *scroll = 0;
             }
             KeyAction::Continue
         }
@@ -460,12 +469,13 @@ fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
             context.filter,
             context.skyline,
         ),
-        ViewMode::Tail { scroll } => draw_tail(
+        ViewMode::Tail { scroll, follow } => draw_tail(
             frame,
             context.source,
             context.sessions,
             context.selected,
             *scroll,
+            *follow,
             context.filter,
             context.skyline,
         ),
@@ -920,12 +930,14 @@ fn monitor_footer() -> Paragraph<'static> {
     .block(Block::default().borders(Borders::TOP))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_tail(
     frame: &mut Frame<'_>,
     source: DashboardSource,
     sessions: &[AgentSession],
     selected: usize,
     scroll: usize,
+    follow: bool,
     filter: SessionFilter,
     skyline: &ActivitySkyline,
 ) {
@@ -943,12 +955,15 @@ fn draw_tail(
     let selected_session = sessions.get(selected);
     let feed = selected_session
         .and_then(|session| load_feed_for_session(source, session, skyline.samples.len() as u64));
+    let viewport = body[1].height.saturating_sub(2) as usize;
     frame.render_widget(Clear, body[1]);
     frame.render_widget(
         tail_feed(
             selected_session,
             feed.as_ref(),
             scroll,
+            follow,
+            viewport,
             body[1].width.saturating_sub(4) as usize,
         ),
         body[1],
@@ -1023,8 +1038,6 @@ fn load_feed_for_session(
     }
 }
 
-#[allow(dead_code)]
-// wired into the tail view in the follow-mode task
 fn feed_scroll_offset(follow: bool, manual_scroll: usize, total_lines: usize, viewport: usize) -> usize {
     let max_start = total_lines.saturating_sub(viewport);
     if follow {
@@ -1038,6 +1051,8 @@ fn tail_feed(
     session: Option<&AgentSession>,
     feed: Option<&SessionFeed>,
     scroll: usize,
+    follow: bool,
+    viewport: usize,
     width: usize,
 ) -> Paragraph<'static> {
     let title = session
@@ -1077,12 +1092,7 @@ fn tail_feed(
         }
     }
 
-    let max_start = lines.len().saturating_sub(1);
-    let scroll = if scroll == usize::MAX {
-        max_start
-    } else {
-        scroll.min(max_start)
-    };
+    let offset = feed_scroll_offset(follow, scroll, lines.len(), viewport);
     Paragraph::new(lines)
         .block(
             Block::default()
@@ -1090,7 +1100,7 @@ fn tail_feed(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Green)),
         )
-        .scroll((scroll as u16, 0))
+        .scroll((offset as u16, 0))
 }
 
 fn missing_journal_lines(session: &AgentSession, width: usize) -> Vec<Line<'static>> {
@@ -1418,7 +1428,7 @@ mod tests {
 
     #[test]
     fn tail_up_down_changes_selected_session_and_resets_scroll() {
-        let mut mode = ViewMode::Tail { scroll: 9 };
+        let mut mode = ViewMode::Tail { scroll: 9, follow: false };
         let mut selected = 1usize;
         let mut filter = SessionFilter::Active;
 
@@ -1435,7 +1445,7 @@ mod tests {
 
     #[test]
     fn tail_jk_scrolls_feed_without_changing_selected_session() {
-        let mut mode = ViewMode::Tail { scroll: 4 };
+        let mut mode = ViewMode::Tail { scroll: 4, follow: false };
         let mut selected = 1usize;
         let mut filter = SessionFilter::Active;
 
@@ -1452,7 +1462,7 @@ mod tests {
 
     #[test]
     fn tail_page_keys_scroll_feed_without_changing_selected_session() {
-        let mut mode = ViewMode::Tail { scroll: 4 };
+        let mut mode = ViewMode::Tail { scroll: 4, follow: false };
         let mut selected = 1usize;
         let mut filter = SessionFilter::Active;
 
@@ -1695,7 +1705,7 @@ mod tests {
 
     fn tail_scroll(mode: &ViewMode) -> Option<usize> {
         match mode {
-            ViewMode::Tail { scroll } => Some(*scroll),
+            ViewMode::Tail { scroll, .. } => Some(*scroll),
             ViewMode::Monitor => None,
         }
     }
