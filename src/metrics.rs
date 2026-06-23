@@ -4,6 +4,23 @@ use std::time::SystemTime;
 use crate::app::AmbientSnapshot;
 use crate::model::{AgentSession, SessionStatus};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentActivity {
+    Idle,
+    Thinking,
+    Output,
+}
+
+pub fn classify(running: bool, tokens_delta: u64) -> AgentActivity {
+    if tokens_delta > 0 {
+        AgentActivity::Output
+    } else if running {
+        AgentActivity::Thinking
+    } else {
+        AgentActivity::Idle
+    }
+}
+
 fn estimate_session_cost(model: Option<&str>, tokens_total: u64) -> f64 {
     let info = crate::pricing::lookup(model.unwrap_or(""));
     // tokens_total is not split into input/output here, so blend the two rates.
@@ -18,6 +35,7 @@ pub struct AgentSample {
     pub cpu_percent: u32,
     pub memory_bytes: u64,
     pub running: bool,
+    pub activity: AgentActivity,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +107,7 @@ impl MetricsHistory {
                 cpu_percent,
                 memory_bytes,
                 running: session.status == SessionStatus::Running,
+                activity: classify(session.status == SessionStatus::Running, delta),
             });
         }
 
@@ -267,5 +286,21 @@ mod tests {
         let foo = h.projects().iter().find(|p| p.project == "foo").expect("foo rollup");
         assert_eq!(foo.live, 1);
         assert!((foo.tokens_per_min - 600.0).abs() < 1.0, "got {}", foo.tokens_per_min);
+    }
+
+    #[test]
+    fn classify_precedence() {
+        assert_eq!(classify(true, 100), AgentActivity::Output);
+        assert_eq!(classify(true, 0), AgentActivity::Thinking);
+        assert_eq!(classify(false, 0), AgentActivity::Idle);
+        assert_eq!(classify(false, 50), AgentActivity::Output); // output even if not flagged running
+    }
+
+    #[test]
+    fn push_records_activity_on_samples() {
+        let mut h = MetricsHistory::new(8);
+        h.push(&snap(0, vec![session("a", 0, true)]));
+        h.push(&snap(1, vec![session("a", 500, true)]));
+        assert_eq!(h.last_agents().unwrap()[0].activity, AgentActivity::Output);
     }
 }
