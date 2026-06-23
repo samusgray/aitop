@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{model::AgentKind, pricing};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileEditHunk {
     pub old_text: String,
     pub new_text: String,

@@ -272,6 +272,7 @@ fn run_loop(
     let mut scorer = ActivityScorer::default();
     skyline.push_snapshot(&snapshot, &mut scorer);
     let mut needs_draw = true;
+    let last_feed_offset = std::cell::Cell::new(0usize);
 
     loop {
         while let Ok(next_snapshot) = snapshot_rx.try_recv() {
@@ -294,6 +295,7 @@ fn run_loop(
                         mode: &mode,
                         filter,
                         skyline: &skyline,
+                        last_feed_offset: &last_feed_offset,
                     },
                 )
             })?;
@@ -308,6 +310,7 @@ fn run_loop(
                 &mut selected,
                 &mut filter,
                 sessions.len(),
+                last_feed_offset.get(),
                 key.code,
             ) {
                 KeyAction::Quit => return Ok(()),
@@ -358,6 +361,7 @@ fn handle_key(
     selected: &mut usize,
     filter: &mut SessionFilter,
     session_count: usize,
+    last_offset: usize,
     key: KeyCode,
 ) -> KeyAction {
     match key {
@@ -391,6 +395,9 @@ fn handle_key(
         }
         KeyCode::Char('k') => {
             if let ViewMode::Tail { scroll, follow } = mode {
+                if *follow {
+                    *scroll = last_offset;
+                }
                 *follow = false;
                 *scroll = scroll.saturating_sub(1);
             } else {
@@ -423,6 +430,9 @@ fn handle_key(
         }
         KeyCode::PageUp => {
             if let ViewMode::Tail { scroll, follow } = mode {
+                if *follow {
+                    *scroll = last_offset;
+                }
                 *follow = false;
                 *scroll = scroll.saturating_sub(5);
             }
@@ -455,6 +465,7 @@ struct DrawContext<'a> {
     mode: &'a ViewMode,
     filter: SessionFilter,
     skyline: &'a ActivitySkyline,
+    last_feed_offset: &'a std::cell::Cell<usize>,
 }
 
 fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
@@ -478,6 +489,7 @@ fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
             *follow,
             context.filter,
             context.skyline,
+            context.last_feed_offset,
         ),
     }
 }
@@ -940,6 +952,7 @@ fn draw_tail(
     follow: bool,
     filter: SessionFilter,
     skyline: &ActivitySkyline,
+    last_feed_offset: &std::cell::Cell<usize>,
 ) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -965,6 +978,7 @@ fn draw_tail(
             follow,
             viewport,
             body[1].width.saturating_sub(4) as usize,
+            last_feed_offset,
         ),
         body[1],
     );
@@ -1054,6 +1068,7 @@ fn tail_feed(
     follow: bool,
     viewport: usize,
     width: usize,
+    last_offset: &std::cell::Cell<usize>,
 ) -> Paragraph<'static> {
     let title = session
         .map(|session| {
@@ -1093,6 +1108,7 @@ fn tail_feed(
     }
 
     let offset = feed_scroll_offset(follow, scroll, lines.len(), viewport);
+    last_offset.set(offset);
     Paragraph::new(lines)
         .block(
             Block::default()
@@ -1432,12 +1448,12 @@ mod tests {
         let mut selected = 1usize;
         let mut filter = SessionFilter::Active;
 
-        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::Down);
+        handle_key(&mut mode, &mut selected, &mut filter, 3, 0, KeyCode::Down);
 
         assert_eq!(selected, 2);
         assert_eq!(tail_scroll(&mode), Some(0));
 
-        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::Up);
+        handle_key(&mut mode, &mut selected, &mut filter, 3, 0, KeyCode::Up);
 
         assert_eq!(selected, 1);
         assert_eq!(tail_scroll(&mode), Some(0));
@@ -1449,12 +1465,12 @@ mod tests {
         let mut selected = 1usize;
         let mut filter = SessionFilter::Active;
 
-        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::Char('j'));
+        handle_key(&mut mode, &mut selected, &mut filter, 3, 0, KeyCode::Char('j'));
 
         assert_eq!(selected, 1);
         assert_eq!(tail_scroll(&mode), Some(5));
 
-        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::Char('k'));
+        handle_key(&mut mode, &mut selected, &mut filter, 3, 0, KeyCode::Char('k'));
 
         assert_eq!(selected, 1);
         assert_eq!(tail_scroll(&mode), Some(4));
@@ -1466,12 +1482,12 @@ mod tests {
         let mut selected = 1usize;
         let mut filter = SessionFilter::Active;
 
-        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::PageDown);
+        handle_key(&mut mode, &mut selected, &mut filter, 3, 0, KeyCode::PageDown);
 
         assert_eq!(selected, 1);
         assert_eq!(tail_scroll(&mode), Some(9));
 
-        handle_key(&mut mode, &mut selected, &mut filter, 3, KeyCode::PageUp);
+        handle_key(&mut mode, &mut selected, &mut filter, 3, 0, KeyCode::PageUp);
 
         assert_eq!(selected, 1);
         assert_eq!(tail_scroll(&mode), Some(4));
@@ -1708,6 +1724,35 @@ mod tests {
             ViewMode::Tail { scroll, .. } => Some(*scroll),
             ViewMode::Monitor => None,
         }
+    }
+
+    fn tail_follow(mode: &ViewMode) -> Option<bool> {
+        match mode {
+            ViewMode::Tail { follow, .. } => Some(*follow),
+            ViewMode::Monitor => None,
+        }
+    }
+
+    #[test]
+    fn follow_k_seeds_scroll_from_last_offset() {
+        // following + last_offset=80, press k → Tail { scroll: 79, follow: false }
+        let mut mode = ViewMode::Tail { scroll: 0, follow: true };
+        let mut selected = 0usize;
+        let mut filter = SessionFilter::Active;
+        handle_key(&mut mode, &mut selected, &mut filter, 3, 80, KeyCode::Char('k'));
+        assert_eq!(tail_scroll(&mode), Some(79));
+        assert_eq!(tail_follow(&mode), Some(false));
+    }
+
+    #[test]
+    fn follow_pageup_seeds_scroll_from_last_offset() {
+        // following + last_offset=80, press PageUp → Tail { scroll: 75, follow: false }
+        let mut mode = ViewMode::Tail { scroll: 0, follow: true };
+        let mut selected = 0usize;
+        let mut filter = SessionFilter::Active;
+        handle_key(&mut mode, &mut selected, &mut filter, 3, 80, KeyCode::PageUp);
+        assert_eq!(tail_scroll(&mode), Some(75));
+        assert_eq!(tail_follow(&mode), Some(false));
     }
 
     fn lines_to_plain_text(lines: Vec<Line<'static>>) -> String {

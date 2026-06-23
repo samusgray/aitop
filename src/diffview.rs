@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -96,7 +95,7 @@ pub fn diff_hunk(old: &str, new: &str) -> Vec<DiffLine> {
 
             let mut segs = Vec::new();
             for (emphasized, value) in change.iter_strings_lossy() {
-                let text = value.trim_end_matches('\n').to_string();
+                let text = value.trim_end_matches(['\r', '\n']).to_string();
                 if !text.is_empty() {
                     segs.push(DiffSeg { text, emphasized });
                 }
@@ -141,32 +140,26 @@ pub fn collapse(mut lines: Vec<DiffLine>, max: usize) -> (Vec<DiffLine>, usize) 
     (lines, hidden)
 }
 
-fn cache() -> &'static Mutex<HashMap<u64, Vec<Line<'static>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<Line<'static>>>>> = OnceLock::new();
+const CACHE_CAP: usize = 256;
+
+type CacheKey = (String, usize, Vec<FileEditHunk>);
+
+fn cache() -> &'static Mutex<HashMap<CacheKey, Vec<Line<'static>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<Line<'static>>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cache_key(path: &str, hunks: &[FileEditHunk], width: usize) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    width.hash(&mut hasher);
-    for hunk in hunks {
-        hunk.old_text.hash(&mut hasher);
-        hunk.new_text.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 pub fn render_file_edit(path: &str, hunks: &[FileEditHunk], width: usize) -> Vec<Line<'static>> {
-    let key = cache_key(path, hunks, width);
+    let key: CacheKey = (path.to_string(), width, hunks.to_vec());
     if let Some(hit) = cache().lock().expect("diff cache lock").get(&key) {
         return hit.clone();
     }
     let rendered = render_file_edit_uncached(path, hunks, width);
-    cache()
-        .lock()
-        .expect("diff cache lock")
-        .insert(key, rendered.clone());
+    let mut map = cache().lock().expect("diff cache lock");
+    if map.len() >= CACHE_CAP {
+        map.clear();
+    }
+    map.insert(key, rendered.clone());
     rendered
 }
 
@@ -220,7 +213,7 @@ fn render_file_edit_uncached(path: &str, hunks: &[FileEditHunk], width: usize) -
 
             let mut col = 0usize; // char offset within `text`
             for (syn, piece) in highlighted {
-                let piece = piece.trim_end_matches('\n');
+                let piece = piece.trim_end_matches(['\r', '\n']);
                 if piece.is_empty() {
                     continue;
                 }
@@ -284,7 +277,28 @@ fn render_file_edit_uncached(path: &str, hunks: &[FileEditHunk], width: usize) -
 mod tests {
     use super::*;
 
-    use crate::feed::FileEditHunk;
+    fn cache_len() -> usize {
+        super::cache().lock().unwrap().len()
+    }
+
+    #[test]
+    fn cache_evicts_when_full() {
+        // Insert CACHE_CAP+1 distinct edits (vary new_text). Without a cap the map
+        // would grow to CACHE_CAP+1; with the eviction logic it must stay <= CACHE_CAP.
+        for i in 0..=super::CACHE_CAP {
+            let hunks = vec![FileEditHunk {
+                old_text: String::new(),
+                new_text: format!("cache_evict_test line {i}\n"),
+            }];
+            render_file_edit("src/evict_test.rs", &hunks, 80);
+        }
+        assert!(
+            cache_len() <= super::CACHE_CAP,
+            "cache grew to {} entries, expected <= {}",
+            cache_len(),
+            super::CACHE_CAP
+        );
+    }
 
     #[test]
     fn render_includes_header_and_diff_rows() {
