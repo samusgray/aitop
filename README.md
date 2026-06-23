@@ -77,6 +77,7 @@ Monitor view:
 
 - `up` / `down` or `j` / `k`: select a session
 - `enter`: open the focused tail view
+- `s`: open the stream view (cross-project activity preview)
 - `a`: cycle overview, active, and all views
 - `r`: refresh
 - `q`: quit
@@ -91,6 +92,19 @@ Tail view (opens at bottom and follows new events):
 - `up` / `down`: select another session (resets to auto-follow)
 - `esc`: return to monitor
 - `a`: return to monitor and cycle views
+- `q`: quit
+
+Stream view (cross-project activity):
+
+- `j` / `k`: select event (k freezes auto-follow)
+- `enter` / `→`: expand selected event (show diff, result, or text)
+- `←`: collapse selected event
+- `p`: cycle project filter
+- `e`: toggle errors-only mode
+- `G`: jump to bottom and resume auto-follow
+- `g`: jump to top
+- `page up` / `page down`: scroll by larger jumps (freeze auto-follow)
+- `esc`: return to monitor
 - `q`: quit
 
 ## Development

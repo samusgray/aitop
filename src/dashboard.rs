@@ -1054,6 +1054,8 @@ fn monitor_footer() -> Paragraph<'static> {
         Span::raw(" select   "),
         Span::styled("enter", key_style()),
         Span::raw(" tail   "),
+        Span::styled("s", key_style()),
+        Span::raw(" stream   "),
         Span::styled("r", key_style()),
         Span::raw(" refresh   "),
         Span::styled("a", key_style()),
