@@ -140,6 +140,11 @@ fn git_root_key(git: &GitStatus) -> String {
 
 pub fn snapshot() -> Result<AmbientSnapshot> {
     let mut sampler = ProcessSampler::new();
+    // A one-shot snapshot has no previous tick to diff against, so prime a
+    // baseline and wait the minimum interval before sampling CPU. The live
+    // dashboard instead reuses the prior tick's snapshot as the baseline.
+    sampler.refresh();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     snapshot_with_sampler(&mut sampler)
 }
 
@@ -696,6 +701,9 @@ pub fn snapshot_with_sampler(sampler: &mut ProcessSampler) -> Result<AmbientSnap
     }
 
     sessions = merge_sessions(sessions);
+    // One snapshot per tick: every pid is sampled from the same refresh, and the
+    // CPU delta is measured against the previous tick's snapshot.
+    sampler.refresh();
     enrich(&mut sessions, sampler);
     sessions.sort_by(|a, b| {
         b.status
@@ -774,7 +782,7 @@ fn merge_into(existing: &mut AgentSession, incoming: AgentSession) {
     }
 }
 
-fn enrich(sessions: &mut [AgentSession], sampler: &mut ProcessSampler) {
+fn enrich(sessions: &mut [AgentSession], sampler: &ProcessSampler) {
     for session in sessions {
         if let Some(pid) = session.pid {
             session.process = sampler.sample(pid);

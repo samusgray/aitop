@@ -122,6 +122,22 @@ pub fn elapsed_label(start: Option<SystemTime>, end: SystemTime) -> String {
     format!("{:02}m {:02}s", seconds / 60, seconds % 60)
 }
 
+/// Elapsed time to display for a session. A running session is still working,
+/// so it counts to `now`; a finished or idle session counts only the span of
+/// real activity (start to last update), not wall-clock age since launch.
+pub fn session_elapsed_label(
+    status: SessionStatus,
+    started_at: Option<SystemTime>,
+    updated_at: Option<SystemTime>,
+    now: SystemTime,
+) -> String {
+    let end = match status {
+        SessionStatus::Running => now,
+        _ => updated_at.unwrap_or(now),
+    };
+    elapsed_label(started_at, end)
+}
+
 pub fn time_label(time: Option<SystemTime>) -> String {
     let Some(time) = time else {
         return "-".to_string();
@@ -137,4 +153,45 @@ pub fn path_home_display(path: &Path) -> String {
         return format!("~/{}", stripped.display());
     }
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn recent_session_elapsed_spans_activity_not_wall_clock_age() {
+        // 100s of real work (started 100, last update 200), but "now" is a day later.
+        let label = session_elapsed_label(
+            SessionStatus::Recent,
+            Some(at(100)),
+            Some(at(200)),
+            at(100_000),
+        );
+        assert_eq!(label, "01m 40s");
+    }
+
+    #[test]
+    fn running_session_elapsed_counts_to_now() {
+        // A live session is still working, so it measures to now.
+        let label = session_elapsed_label(
+            SessionStatus::Running,
+            Some(at(100)),
+            Some(at(120)),
+            at(160),
+        );
+        assert_eq!(label, "01m 00s");
+    }
+
+    #[test]
+    fn missing_update_falls_back_to_now() {
+        let label =
+            session_elapsed_label(SessionStatus::Recent, Some(at(100)), None, at(160));
+        assert_eq!(label, "01m 00s");
+    }
 }

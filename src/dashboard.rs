@@ -28,7 +28,7 @@ use crate::{
         snapshot_with_sampler, visible_sessions,
     },
     feed::{Annotation, FeedEvent, FeedRecord, SessionFeed, load_session_feed},
-    model::{AgentSession, SessionStatus, elapsed_label, path_home_display, time_label},
+    model::{AgentSession, SessionStatus, path_home_display, session_elapsed_label, time_label},
     pricing::{compact_tokens, short_model},
     process::ProcessSampler,
 };
@@ -744,7 +744,10 @@ fn session_row(session: &AgentSession, now: std::time::SystemTime) -> Line<'stat
             format!("{:<12}", truncate(&session.repo_name(), 11)),
             accent(),
         ),
-        Span::raw(format!("{:<10}", elapsed_label(session.started_at, now))),
+        Span::raw(format!(
+            "{:<10}",
+            session_elapsed_label(session.status, session.started_at, session.updated_at, now)
+        )),
         Span::raw(format!("{:<9}", pid)),
         Span::styled(format!("{:<13}", cpu), Style::default().fg(Color::Green)),
         Span::raw(format!("{:<11}", mem)),

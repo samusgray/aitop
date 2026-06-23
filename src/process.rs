@@ -21,8 +21,14 @@ impl ProcessSampler {
         }
     }
 
-    pub fn sample(&mut self, root_pid: u32) -> Option<ProcessStats> {
+    /// Take a fresh system snapshot. Call once per refresh tick; CPU usage is a
+    /// delta between consecutive snapshots, so spacing these by the tick interval
+    /// is what makes `sample` report meaningful percentages.
+    pub fn refresh(&mut self) {
         self.system.refresh_all();
+    }
+
+    pub fn sample(&self, root_pid: u32) -> Option<ProcessStats> {
         let root_pid = Pid::from_u32(root_pid);
         let root = self.system.process(root_pid)?;
         let child_pids = descendant_pids(&self.system, root_pid.as_u32());
@@ -62,5 +68,22 @@ fn collect(system: &System, parent: u32, seen: &mut HashSet<u32>, found: &mut Ve
             found.push(child);
             collect(system, child, seen, found);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_reads_snapshot_taken_by_refresh() {
+        let mut sampler = ProcessSampler::new();
+        sampler.refresh();
+        // sample() must read the snapshot refresh() took, not refresh per call,
+        // so the dashboard can refresh once per tick and sample every pid from it.
+        let stats = sampler
+            .sample(std::process::id())
+            .expect("the test process itself should be sampled after a refresh");
+        assert!(stats.memory_bytes > 0, "memory should be reported in bytes");
     }
 }
