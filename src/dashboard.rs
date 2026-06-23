@@ -1226,8 +1226,9 @@ fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
             dim(),
         ))],
         FeedEvent::Unknown { kind } => vec![Line::from(Span::styled(format!("? {kind}"), dim()))],
-        // TODO(task-7): render inline diff; temporary stub to keep build green
-        FeedEvent::FileEdit { .. } => Vec::new(),
+        FeedEvent::FileEdit { path, hunks } => {
+            crate::diffview::render_file_edit(path, hunks, width)
+        }
     }
 }
 
