@@ -147,6 +147,10 @@ impl MetricsHistory {
         self.global.iter().map(|g| g.tokens_per_sec).collect()
     }
 
+    pub fn cost_series(&self) -> Vec<f64> {
+        self.global.iter().map(|g| g.cost_total).collect()
+    }
+
     pub fn latest_global(&self) -> Option<&GlobalSample> {
         self.global.back()
     }

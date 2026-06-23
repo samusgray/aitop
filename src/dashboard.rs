@@ -344,7 +344,114 @@ fn draw_monitor(
     }
 }
 
-fn render_throughput(_frame: &mut Frame, _history: &crate::metrics::MetricsHistory, _area: Rect) {}
+fn render_throughput(frame: &mut Frame<'_>, history: &crate::metrics::MetricsHistory, area: Rect) {
+    use ratatui::{symbols::Marker, widgets::canvas::{Canvas, Points}};
+
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(Line::from(Span::styled(" agent throughput ", title_style())))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Split inner: one row for readout, rest for the braille canvas.
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+    let readout_area = split[0];
+    let canvas_area = split[1];
+
+    let series = history.throughput_series();
+    let cost_series = history.cost_series();
+    let latest = history.latest_global();
+
+    let (tok_s, cost_total, live) = latest
+        .map(|g| (g.tokens_per_sec, g.cost_total, g.live))
+        .unwrap_or((0.0, 0.0, 0));
+
+    let rate_str = throughput_burn_rate_hr(&cost_series)
+        .map(|r| format!("${r:.2}/hr"))
+        .unwrap_or_else(|| "-".to_string());
+
+    let readout = format!("▲ {tok_s:.0} tok/s · ${cost_total:.2} · {rate_str} · {live} live");
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            readout,
+            Style::default().fg(Color::Cyan),
+        ))),
+        readout_area,
+    );
+
+    if canvas_area.height == 0 || canvas_area.width == 0 || series.is_empty() {
+        return;
+    }
+
+    let max_val = series.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
+    let n = series.len();
+    let canvas_h = canvas_area.height;
+
+    frame.render_widget(
+        Canvas::default()
+            .marker(Marker::Braille)
+            .x_bounds([0.0, n as f64])
+            .y_bounds([0.0, max_val])
+            .paint(move |ctx| {
+                // Number of y-samples per column: match braille vertical resolution.
+                let steps = (canvas_h as usize * 4).max(1);
+                let mut cyan_pts: Vec<(f64, f64)> = Vec::new();
+                let mut green_pts: Vec<(f64, f64)> = Vec::new();
+                let mut hot_pts: Vec<(f64, f64)> = Vec::new();
+
+                for (i, &val) in series.iter().enumerate() {
+                    if val <= 0.0 {
+                        continue;
+                    }
+                    // x centred in each integer-width column bucket.
+                    let x = i as f64 + 0.5;
+                    let norm = val / max_val;
+
+                    for j in 0..=steps {
+                        let y = val * j as f64 / steps as f64;
+                        let pt = (x, y);
+                        if norm < 0.33 {
+                            cyan_pts.push(pt);
+                        } else if norm < 0.66 {
+                            green_pts.push(pt);
+                        } else {
+                            hot_pts.push(pt);
+                        }
+                    }
+                }
+
+                ctx.draw(&Points { coords: &cyan_pts, color: Color::Rgb(0, 200, 200) });
+                ctx.draw(&Points { coords: &green_pts, color: Color::Rgb(0, 200, 0) });
+                ctx.draw(&Points { coords: &hot_pts, color: Color::Rgb(220, 80, 0) });
+            }),
+        canvas_area,
+    );
+}
+
+fn throughput_burn_rate_hr(cost_series: &[f64]) -> Option<f64> {
+    if cost_series.len() < 2 {
+        return None;
+    }
+    let first = *cost_series.first()?;
+    let last = *cost_series.last()?;
+    let delta = last - first;
+    if delta <= 0.0 {
+        return None;
+    }
+    // Samples are ~1 second apart; extrapolate to one hour.
+    let window_secs = (cost_series.len() - 1) as f64;
+    Some(delta / window_secs * 3600.0)
+}
 
 fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'static> {
     let status = if snapshot.active_count() == 0 {
@@ -1133,6 +1240,34 @@ fn status_style(status: SessionStatus) -> Style {
 }
 
 #[cfg(test)]
+pub(crate) fn tests_support_snapshot(at: u64) -> crate::app::AmbientSnapshot {
+    use crate::model::{AgentKind, AgentSession, SessionStatus};
+    let s = AgentSession {
+        agent: AgentKind::Claude,
+        native_id: Some("a".into()),
+        title: None,
+        command: None,
+        cwd: std::path::PathBuf::from("/x"),
+        pid: None,
+        status: SessionStatus::Running,
+        started_at: None,
+        updated_at: None,
+        model: None,
+        tokens_total: Some((at * 100) as i64),
+        git_branch: None,
+        journal_path: None,
+        process: None,
+        git: None,
+    };
+    crate::app::AmbientSnapshot {
+        sessions: vec![s],
+        generated_at: std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(at),
+        activity: Vec::new(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{AgentKind, AgentSession};
@@ -1306,6 +1441,25 @@ mod tests {
         handle_key(&mut mode, &mut selected, &mut filter, 3, 80, KeyCode::PageUp);
         assert_eq!(tail_scroll(&mode), Some(75));
         assert_eq!(tail_follow(&mode), Some(false));
+    }
+
+    #[test]
+    fn throughput_renders_without_panicking() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut h = crate::metrics::MetricsHistory::new(64);
+        for t in 0..30 {
+            h.push(&super::tests_support_snapshot(t));
+        }
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| super::render_throughput(f, &h, f.area())).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("tok/s"), "readout present");
     }
 
     fn lines_to_plain_text(lines: Vec<Line<'static>>) -> String {
