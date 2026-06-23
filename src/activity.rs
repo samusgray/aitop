@@ -150,6 +150,13 @@ pub fn event_from_record(
     }
 }
 
+pub fn filter_events<'a>(events: &'a [StreamEvent], project: Option<&str>, errors_only: bool) -> Vec<&'a StreamEvent> {
+    events.iter()
+        .filter(|e| project.map(|p| e.project == p).unwrap_or(true))
+        .filter(|e| !errors_only || e.is_error)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +235,15 @@ mod tests {
         let e = event_from_record(&r, "p", AgentKind::Claude, "k");
         assert!(matches!(e.kind, StreamKind::Result));
         assert!(e.summary.contains("mystery"));
+    }
+
+    #[test]
+    fn filters_by_project_and_errors() {
+        let mut a = ev(Some(1), "a"); a.is_error = true;
+        let b = ev(Some(2), "b");
+        let events = vec![a, b];
+        assert_eq!(filter_events(&events, Some("a"), false).len(), 1);
+        assert_eq!(filter_events(&events, None, true).len(), 1);
+        assert_eq!(filter_events(&events, Some("b"), true).len(), 0);
     }
 }
