@@ -1023,6 +1023,17 @@ fn load_feed_for_session(
     }
 }
 
+#[allow(dead_code)]
+// wired into the tail view in the follow-mode task
+fn feed_scroll_offset(follow: bool, manual_scroll: usize, total_lines: usize, viewport: usize) -> usize {
+    let max_start = total_lines.saturating_sub(viewport);
+    if follow {
+        max_start
+    } else {
+        manual_scroll.min(max_start)
+    }
+}
+
 fn tail_feed(
     session: Option<&AgentSession>,
     feed: Option<&SessionFeed>,
@@ -1647,6 +1658,24 @@ mod tests {
         assert!(text.contains("⚠ ERR"));
         assert!(text.contains("FAIL test/session.spec.ts"));
         assert!(text.contains("│"));
+    }
+
+    #[test]
+    fn follow_anchors_last_page_to_bottom() {
+        // 100 lines, 20-row viewport: first visible line is 80.
+        assert_eq!(super::feed_scroll_offset(true, 0, 100, 20), 80);
+    }
+
+    #[test]
+    fn follow_with_short_feed_starts_at_top() {
+        assert_eq!(super::feed_scroll_offset(true, 0, 10, 20), 0);
+    }
+
+    #[test]
+    fn manual_scroll_is_clamped_to_max_start() {
+        // Can't scroll past total - viewport.
+        assert_eq!(super::feed_scroll_offset(false, 999, 100, 20), 80);
+        assert_eq!(super::feed_scroll_offset(false, 25, 100, 20), 25);
     }
 
     #[test]
