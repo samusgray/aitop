@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use crate::app::AmbientSnapshot;
 use crate::feed::{FeedEvent, FeedRecord, FileEditHunk, sanitize_inline, truncate_summary};
 use crate::model::AgentKind;
 use crate::pricing::compact_tokens;
@@ -31,6 +32,40 @@ pub struct StreamEvent {
     pub summary: String,
     pub detail: Option<StreamDetail>,
     pub is_error: bool,
+}
+
+pub struct ActivityIndex {
+    events: Vec<StreamEvent>,
+}
+
+impl ActivityIndex {
+    pub fn from_events(mut events: Vec<StreamEvent>) -> Self {
+        events.sort_by_key(|a| a.timestamp);
+        Self { events }
+    }
+
+    pub fn events(&self) -> &[StreamEvent] {
+        &self.events
+    }
+
+    pub fn build(snapshot: &AmbientSnapshot, per_session: usize, max_total: usize) -> Self {
+        let mut all = Vec::new();
+        for session in &snapshot.sessions {
+            let Some(path) = session.journal_path.as_ref() else { continue };
+            let key = crate::metrics::session_key(session);
+            let project = session.repo_name();
+            let id = session.native_id.clone().unwrap_or_default();
+            for record in crate::feed::tail_records(path, session.agent, &id, per_session) {
+                all.push(event_from_record(&record, &project, session.agent, &key));
+            }
+        }
+        let mut idx = Self::from_events(all);
+        if idx.events.len() > max_total {
+            let cut = idx.events.len() - max_total;
+            idx.events.drain(0..cut);
+        }
+        idx
+    }
 }
 
 pub fn event_from_record(
@@ -120,6 +155,26 @@ mod tests {
     use super::*;
     use crate::feed::{FeedEvent, FeedRecord, FileEditHunk};
     use crate::model::AgentKind;
+
+    fn ev(at: Option<u64>, project: &str) -> StreamEvent {
+        StreamEvent {
+            timestamp: at.map(|s| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s)),
+            project: project.into(),
+            agent: AgentKind::Claude,
+            session_key: "k".into(),
+            kind: StreamKind::User,
+            summary: format!("{project}@{at:?}"),
+            detail: None,
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn merge_sorts_ascending_and_caps() {
+        let idx = ActivityIndex::from_events(vec![ev(Some(3), "a"), ev(Some(1), "b"), ev(Some(2), "a")]);
+        let times: Vec<_> = idx.events().iter().map(|e| e.timestamp).collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "ascending by time");
+    }
 
     fn rec(event: FeedEvent) -> FeedRecord {
         FeedRecord { session_id: "s".into(), timestamp: None, event, annotations: vec![] }
