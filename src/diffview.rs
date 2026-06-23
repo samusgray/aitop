@@ -73,9 +73,27 @@ pub fn diff_hunk(old: &str, new: &str) -> Vec<DiffLine> {
     out
 }
 
+pub fn collapse(mut lines: Vec<DiffLine>, max: usize) -> (Vec<DiffLine>, usize) {
+    if lines.len() <= max {
+        return (lines, 0);
+    }
+    let hidden = lines.len() - max;
+    lines.truncate(max);
+    (lines, hidden)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx_line(n: usize) -> DiffLine {
+        DiffLine {
+            kind: DiffLineKind::Context,
+            old_no: Some(n),
+            new_no: Some(n),
+            segs: vec![DiffSeg { text: format!("line {n}"), emphasized: false }],
+        }
+    }
 
     #[test]
     fn classifies_added_removed_context_lines() {
@@ -108,5 +126,21 @@ mod tests {
             added.segs.iter().any(|s| s.emphasized && s.text.contains('2')),
             "the changed token is emphasized"
         );
+    }
+
+    #[test]
+    fn collapse_keeps_all_when_under_cap() {
+        let lines = (1..=5).map(ctx_line).collect::<Vec<_>>();
+        let (kept, hidden) = collapse(lines, 20);
+        assert_eq!(kept.len(), 5);
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn collapse_truncates_and_reports_hidden() {
+        let lines = (1..=25).map(ctx_line).collect::<Vec<_>>();
+        let (kept, hidden) = collapse(lines, 20);
+        assert_eq!(kept.len(), 20);
+        assert_eq!(hidden, 5);
     }
 }
