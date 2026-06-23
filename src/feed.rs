@@ -11,6 +11,12 @@ use serde_json::Value;
 use crate::{model::AgentKind, pricing};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEditHunk {
+    pub old_text: String,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedEvent {
     User {
         text: String,
@@ -26,6 +32,10 @@ pub enum FeedEvent {
         id: String,
         name: String,
         summary: String,
+    },
+    FileEdit {
+        path: String,
+        hunks: Vec<FileEditHunk>,
     },
     ToolResult {
         id: String,
@@ -308,6 +318,11 @@ fn claude_block_to_record(
                 .unwrap_or("")
                 .to_string();
             let input = block.get("input").unwrap_or(&Value::Null);
+            if let Some((path, hunks)) = parse_file_edit(name, input) {
+                let mut rec = record(session_id, timestamp, FeedEvent::FileEdit { path: path.clone(), hunks });
+                rec.annotations.push(Annotation::FileTouched(path));
+                return Some(rec);
+            }
             let (summary, annotation) = summarize_tool(name, input);
             let mut rec = record(
                 session_id,
@@ -434,6 +449,51 @@ fn content_text(payload: &Value) -> Option<&str> {
         })
 }
 
+pub fn parse_file_edit(name: &str, input: &Value) -> Option<(String, Vec<FileEditHunk>)> {
+    let path = input.get("file_path").and_then(Value::as_str)?.to_string();
+    let hunks = match name {
+        "Edit" | "NotebookEdit" => vec![FileEditHunk {
+            old_text: input
+                .get("old_string")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            new_text: input
+                .get("new_string")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }],
+        "MultiEdit" => input
+            .get("edits")
+            .and_then(Value::as_array)?
+            .iter()
+            .map(|edit| FileEditHunk {
+                old_text: edit
+                    .get("old_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                new_text: edit
+                    .get("new_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect(),
+        "Write" => vec![FileEditHunk {
+            old_text: String::new(),
+            new_text: input
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }],
+        _ => return None,
+    };
+    Some((path, hunks))
+}
+
 fn summarize_tool(name: &str, input: &Value) -> (String, Option<Annotation>) {
     if name == "Bash" {
         let command = input.get("command").and_then(Value::as_str).unwrap_or("");
@@ -504,4 +564,49 @@ pub fn truncate_summary(text: &str, max_chars: usize) -> String {
         .take(max_chars.saturating_sub(1))
         .collect::<String>();
     format!("{kept}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_edit_into_single_hunk() {
+        let input = json!({"file_path": "/a/b.rs", "old_string": "x", "new_string": "y"});
+        let (path, hunks) = parse_file_edit("Edit", &input).expect("edit parses");
+        assert_eq!(path, "/a/b.rs");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_text, "x");
+        assert_eq!(hunks[0].new_text, "y");
+    }
+
+    #[test]
+    fn parses_multiedit_into_one_hunk_per_edit() {
+        let input = json!({
+            "file_path": "/a/b.rs",
+            "edits": [
+                {"old_string": "a", "new_string": "A"},
+                {"old_string": "b", "new_string": "B"}
+            ]
+        });
+        let (_, hunks) = parse_file_edit("MultiEdit", &input).expect("multiedit parses");
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[1].new_text, "B");
+    }
+
+    #[test]
+    fn parses_write_as_all_added() {
+        let input = json!({"file_path": "/a/b.rs", "content": "line1\nline2\n"});
+        let (_, hunks) = parse_file_edit("Write", &input).expect("write parses");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_text, "");
+        assert_eq!(hunks[0].new_text, "line1\nline2\n");
+    }
+
+    #[test]
+    fn non_edit_tool_is_none() {
+        let input = json!({"command": "ls"});
+        assert!(parse_file_edit("Bash", &input).is_none());
+    }
 }
