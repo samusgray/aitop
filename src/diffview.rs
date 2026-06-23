@@ -33,6 +33,14 @@ fn row_bg(kind: DiffLineKind) -> Option<Color> {
     }
 }
 
+fn emphasis_bg(kind: DiffLineKind) -> Option<Color> {
+    match kind {
+        DiffLineKind::Added => Some(Color::Rgb(30, 90, 40)),
+        DiffLineKind::Removed => Some(Color::Rgb(110, 35, 35)),
+        DiffLineKind::Context => None,
+    }
+}
+
 fn extension(path: &str) -> &str {
     match path.rsplit_once('.') {
         Some((_, ext)) => ext,
@@ -170,20 +178,47 @@ pub fn render_file_edit(path: &str, hunks: &[FileEditHunk], width: usize) -> Vec
             let highlighted = highlighter
                 .highlight_line(&line_text, syntaxes)
                 .unwrap_or_default();
+            // Per-character emphasis flags for this line (parallel to `text`).
+            let emphasis: Vec<bool> = diff_line
+                .segs
+                .iter()
+                .flat_map(|seg| std::iter::repeat_n(seg.emphasized, seg.text.chars().count()))
+                .collect();
+            let strong_bg = emphasis_bg(diff_line.kind);
+
+            let mut col = 0usize; // char offset within `text`
             for (syn, piece) in highlighted {
                 let piece = piece.trim_end_matches('\n');
                 if piece.is_empty() {
                     continue;
                 }
-                let mut style = Style::default().fg(Color::Rgb(
-                    syn.foreground.r,
-                    syn.foreground.g,
-                    syn.foreground.b,
-                ));
-                if let Some(color) = bg {
-                    style = style.bg(color);
+                let fg = Color::Rgb(syn.foreground.r, syn.foreground.g, syn.foreground.b);
+
+                // Walk the piece, grouping consecutive chars by emphasis flag.
+                let mut group = String::new();
+                let mut group_emph = emphasis.get(col).copied().unwrap_or(false);
+                for ch in piece.chars() {
+                    let emph = emphasis.get(col).copied().unwrap_or(false);
+                    if emph != group_emph && !group.is_empty() {
+                        let mut style = Style::default().fg(fg);
+                        if let Some(color) = if group_emph { strong_bg } else { bg } {
+                            style = style.bg(color);
+                        }
+                        spans.push(Span::styled(std::mem::take(&mut group), style));
+                        group_emph = emph;
+                    } else if group.is_empty() {
+                        group_emph = emph;
+                    }
+                    group.push(ch);
+                    col += 1;
                 }
-                spans.push(Span::styled(piece.to_string(), style));
+                if !group.is_empty() {
+                    let mut style = Style::default().fg(fg);
+                    if let Some(color) = if group_emph { strong_bg } else { bg } {
+                        style = style.bg(color);
+                    }
+                    spans.push(Span::styled(group, style));
+                }
             }
 
             // Pad to the pane width so the row background fills the line.
@@ -282,6 +317,21 @@ mod tests {
             added.segs.iter().any(|s| s.emphasized && s.text.contains('2')),
             "the changed token is emphasized"
         );
+    }
+
+    #[test]
+    fn emphasized_tokens_get_a_brighter_background() {
+        let hunks = vec![FileEditHunk {
+            old_text: "let x = 1;\n".to_string(),
+            new_text: "let x = 2;\n".to_string(),
+        }];
+        let lines = render_file_edit("src/x.rs", &hunks, 80);
+        let bright = Color::Rgb(30, 90, 40);
+        let has_bright = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.bg == Some(bright));
+        assert!(has_bright, "a changed token should use the emphasis background");
     }
 
     #[test]
