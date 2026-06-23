@@ -77,6 +77,7 @@ fn run_loop(
     let mut snapshot = snapshot_for_source(source, 0, &mut sampler)?;
     let mut history = crate::metrics::MetricsHistory::new(240);
     history.push(&snapshot);
+    let mut activity_index = crate::activity::ActivityIndex::build(&snapshot, 40, 500);
     let mut needs_draw = true;
     let last_feed_offset = std::cell::Cell::new(0usize);
 
@@ -84,6 +85,7 @@ fn run_loop(
         while let Ok(next_snapshot) = snapshot_rx.try_recv() {
             snapshot = next_snapshot;
             history.push(&snapshot);
+            activity_index = crate::activity::ActivityIndex::build(&snapshot, 40, 500);
             needs_draw = true;
         }
 
@@ -102,6 +104,7 @@ fn run_loop(
                         filter,
                         history: &history,
                         last_feed_offset: &last_feed_offset,
+                        activity_index: &activity_index,
                     },
                 )
             })?;
@@ -127,6 +130,7 @@ fn run_loop(
                         &mut sampler,
                     )?;
                     history.push(&snapshot);
+                    activity_index = crate::activity::ActivityIndex::build(&snapshot, 40, 500);
                     needs_draw = true;
                 }
                 KeyAction::Continue => needs_draw = true,
@@ -272,6 +276,7 @@ struct DrawContext<'a> {
     filter: SessionFilter,
     history: &'a crate::metrics::MetricsHistory,
     last_feed_offset: &'a std::cell::Cell<usize>,
+    activity_index: &'a crate::activity::ActivityIndex,
 }
 
 fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
@@ -285,6 +290,7 @@ fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
             context.selected,
             context.filter,
             context.history,
+            context.activity_index,
         ),
         ViewMode::Tail { scroll, follow } => draw_tail(
             frame,
@@ -307,6 +313,7 @@ fn draw_monitor(
     selected: usize,
     filter: SessionFilter,
     history: &crate::metrics::MetricsHistory,
+    activity_index: &crate::activity::ActivityIndex,
 ) {
     let compact = frame.area().height < 32;
     let panel_height = if compact { 5 } else { 7 };
@@ -337,7 +344,7 @@ fn draw_monitor(
     frame.render_widget(session_table(snapshot, sessions, selected, filter), main[0]);
     frame.render_widget(Clear, main[1]);
     frame.render_widget(session_detail(sessions.get(selected)), main[1]);
-    render_activity(frame, snapshot, vertical[4]);
+    render_activity_preview(frame, activity_index, vertical[4]);
     frame.render_widget(Clear, vertical[5]);
     frame.render_widget(monitor_footer(), vertical[5]);
 
@@ -768,51 +775,108 @@ fn session_detail(session: Option<&AgentSession>) -> Paragraph<'static> {
     )
 }
 
-fn render_activity(frame: &mut Frame<'_>, snapshot: &AmbientSnapshot, area: Rect) {
+pub(crate) fn render_activity_preview(
+    frame: &mut Frame<'_>,
+    index: &crate::activity::ActivityIndex,
+    area: Rect,
+) {
+    use crate::activity::StreamKind;
+
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        activity(snapshot, area.width.saturating_sub(4) as usize),
-        area,
-    );
-}
 
-fn activity(snapshot: &AmbientSnapshot, width: usize) -> Paragraph<'static> {
-    Paragraph::new(activity_lines(snapshot, width)).block(
-        Block::default()
-            .title(Line::from(vec![
-                Span::styled(" activity ", title_style()),
-                Span::styled(activity_subtitle(snapshot), dim()),
-            ]))
-            .borders(Borders::ALL),
-    )
-}
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" activity ", title_style()),
+            Span::styled("s: stream ", dim()),
+        ]))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-fn activity_lines(snapshot: &AmbientSnapshot, width: usize) -> Vec<Line<'static>> {
-    if snapshot.active_count() == 0 {
-        return vec![Line::from(truncate(
-            " -   watching native sources - no live agent activity",
-            width,
-        ))];
+    if inner.height == 0 {
+        return;
     }
-    if snapshot.activity.is_empty() {
-        return vec![Line::from(truncate(
-            " -   watching native Claude/Codex activity",
-            width,
-        ))];
-    }
-    snapshot
-        .activity
-        .iter()
-        .map(|line| Line::from(truncate(line, width)))
-        .collect()
-}
 
-fn activity_subtitle(snapshot: &AmbientSnapshot) -> &'static str {
-    if snapshot.active_count() == 0 {
-        "idle "
+    let k = inner.height as usize;
+    let events = index.events();
+    let start = events.len().saturating_sub(k);
+    let visible = &events[start..];
+
+    let max_summary = inner.width.saturating_sub(20) as usize;
+
+    let lines: Vec<Line<'static>> = if visible.is_empty() {
+        vec![Line::from(Span::styled(
+            " -   watching for cross-project activity",
+            dim(),
+        ))]
     } else {
-        "live project events "
-    }
+        visible
+            .iter()
+            .map(|event| {
+                let time_str = event
+                    .timestamp
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Local> = t.into();
+                        dt.format("%H:%M").to_string()
+                    })
+                    .unwrap_or_else(|| "--:--".to_string());
+
+                let glyph = match event.kind {
+                    StreamKind::User => "›",
+                    StreamKind::Assistant => "✦",
+                    StreamKind::Thinking => "✻",
+                    StreamKind::Tool => "⚙",
+                    StreamKind::Result => "↳",
+                    StreamKind::FileEdit => "✎",
+                    StreamKind::Usage => "$",
+                };
+
+                let project_col = truncate(&event.project, 10);
+                let summary_col = truncate(&event.summary, max_summary);
+
+                if event.is_error {
+                    Line::from(vec![
+                        Span::styled(format!("{time_str} "), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{project_col:<10} "),
+                            Style::default().fg(Color::Red),
+                        ),
+                        Span::styled(
+                            format!("{glyph} "),
+                            Style::default().fg(Color::Red),
+                        ),
+                        Span::styled(summary_col, Style::default().fg(Color::Red)),
+                    ])
+                } else {
+                    let proj_style = project_color(&event.project);
+                    Line::from(vec![
+                        Span::styled(format!("{time_str} "), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{project_col:<10} "), proj_style),
+                        Span::styled(format!("{glyph} "), dim()),
+                        Span::styled(summary_col, Style::default().fg(Color::Gray)),
+                    ])
+                }
+            })
+            .collect()
+    };
+
+    frame.render_widget(ratatui::widgets::Paragraph::new(lines), inner);
+}
+
+fn project_color(project: &str) -> Style {
+    let palette = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Magenta,
+        Color::LightBlue,
+        Color::LightCyan,
+        Color::LightGreen,
+    ];
+    let hash: usize = project
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+    Style::default().fg(palette[hash % palette.len()])
 }
 
 fn monitor_footer() -> Paragraph<'static> {
@@ -1444,18 +1508,37 @@ mod tests {
     }
 
     #[test]
-    fn activity_panel_is_quiet_when_no_sessions_are_active() {
-        let snapshot = AmbientSnapshot {
-            sessions: vec![test_session("recent", SessionStatus::Recent, "/repo", 10)],
-            generated_at: SystemTime::UNIX_EPOCH,
-            activity: vec!["04:25:19 observed recent - codex".to_string()],
+    fn activity_preview_renders_project_name() {
+        use crate::activity::{ActivityIndex, StreamEvent, StreamKind};
+        use crate::model::AgentKind;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let event = StreamEvent {
+            timestamp: None,
+            project: "my-project".to_string(),
+            agent: AgentKind::Claude,
+            session_key: "k".to_string(),
+            kind: StreamKind::Assistant,
+            summary: "hello world".to_string(),
+            detail: None,
+            is_error: false,
         };
+        let index = ActivityIndex::from_events(vec![event]);
 
-        let text = lines_to_plain_text(activity_lines(&snapshot, 120));
-
-        assert!(text.contains("watching native sources"));
-        assert!(text.contains("no live agent activity"));
-        assert!(!text.contains("observed recent"));
+        let mut term = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        term.draw(|f| super::render_activity_preview(f, &index, f.area()))
+            .unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("my-project"),
+            "project name must appear in the activity preview buffer"
+        );
     }
 
     #[test]
@@ -1573,27 +1656,5 @@ mod tests {
             .join("\n")
     }
 
-    fn test_session(id: &str, status: SessionStatus, cwd: &str, updated_at: u64) -> AgentSession {
-        AgentSession {
-            agent: AgentKind::Codex,
-            native_id: Some(id.to_string()),
-            title: None,
-            command: Some("codex".to_string()),
-            cwd: cwd.into(),
-            pid: if status == SessionStatus::Running {
-                Some(123)
-            } else {
-                None
-            },
-            status,
-            started_at: None,
-            updated_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(updated_at)),
-            model: None,
-            tokens_total: None,
-            git_branch: None,
-            journal_path: None,
-            process: None,
-            git: None,
-        }
-    }
 }
+
