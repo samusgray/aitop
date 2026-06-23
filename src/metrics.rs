@@ -54,6 +54,7 @@ pub struct ProjectRollup {
     pub dirty_files: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct Lane {
     pub key: String,
     pub label: String,

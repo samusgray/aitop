@@ -1004,6 +1004,87 @@ pub(crate) fn render_activity_preview(
     frame.render_widget(ratatui::widgets::Paragraph::new(lines), inner);
 }
 
+pub fn render_swimlane(
+    frame: &mut Frame<'_>,
+    history: &crate::metrics::MetricsHistory,
+    area: Rect,
+) {
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" agent timeline", title_style()),
+            Span::styled("  ▎thinking", Style::default().fg(Color::Cyan)),
+            Span::styled(" ▎output", Style::default().fg(Color::Green)),
+            Span::styled(" ▎idle ", Style::default().fg(Color::DarkGray)),
+        ]))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let inner_height = inner.height as usize;
+    let inner_width = inner.width as usize;
+
+    const LABEL_WIDTH: usize = 14;
+    // label column + 1 space separator; bar gets the rest
+    let bar_width = inner_width.saturating_sub(LABEL_WIDTH + 1);
+
+    let lanes = history.lanes(inner_height);
+    let total = lanes.len();
+
+    // Reserve a row for "+N more" only when lanes overflow
+    let render_count = if total > inner_height {
+        inner_height.saturating_sub(1)
+    } else {
+        total.min(inner_height)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for lane in lanes.iter().take(render_count) {
+        let label = truncate(&lane.label, LABEL_WIDTH);
+        let label_padded = format!("{label:<LABEL_WIDTH$} ");
+
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(label_padded, dim())];
+
+        if bar_width > 0 {
+            let slices = &lane.slices;
+            let start = slices.len().saturating_sub(bar_width);
+            for activity in &slices[start..] {
+                let (glyph, style) = match activity {
+                    crate::metrics::AgentActivity::Output => {
+                        ("█", Style::default().fg(Color::Green))
+                    }
+                    crate::metrics::AgentActivity::Thinking => {
+                        ("█", Style::default().fg(Color::Cyan))
+                    }
+                    crate::metrics::AgentActivity::Idle => {
+                        (" ", Style::default().fg(Color::DarkGray))
+                    }
+                };
+                spans.push(Span::styled(glyph, style));
+            }
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    if total > render_count {
+        let more = total - render_count;
+        lines.push(Line::from(Span::styled(format!(" +{more} more"), dim())));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("  no agent data yet", dim())));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Glyph for each stream event kind.
 fn kind_glyph(kind: &crate::activity::StreamKind) -> &'static str {
     use crate::activity::StreamKind;
@@ -2229,6 +2310,18 @@ mod tests {
             super::draw_stream(f, &index, 0, 0, true, &BTreeSet::new(), &None, false, &last_scroll)
         })
         .unwrap();
+    }
+
+    #[test]
+    fn swimlane_renders_lane_label() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut h = crate::metrics::MetricsHistory::new(16);
+        h.push(&super::tests_support_snapshot(0));
+        h.push(&super::tests_support_snapshot(1));
+        let mut term = Terminal::new(TestBackend::new(80, 7)).unwrap();
+        term.draw(|f| super::render_swimlane(f, &h, f.area())).unwrap();
+        let content: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("agent timeline"), "titled");
     }
 
     fn lines_to_plain_text(lines: Vec<Line<'static>>) -> String {
