@@ -54,6 +54,12 @@ pub struct ProjectRollup {
     pub dirty_files: usize,
 }
 
+pub struct Lane {
+    pub key: String,
+    pub label: String,
+    pub slices: Vec<AgentActivity>,
+}
+
 pub fn session_key(session: &AgentSession) -> String {
     format!(
         "{}:{}",
@@ -176,6 +182,42 @@ impl MetricsHistory {
 
     pub fn projects(&self) -> &[ProjectRollup] {
         &self.projects
+    }
+
+    pub fn lanes(&self, max_lanes: usize) -> Vec<Lane> {
+        let ticks: Vec<&Vec<AgentSample>> = self.agents.iter().collect();
+        let mut keys: Vec<String> = Vec::new();
+        for tick in &ticks {
+            for s in tick.iter() {
+                if !keys.contains(&s.key) {
+                    keys.push(s.key.clone());
+                }
+            }
+        }
+        let mut lanes: Vec<Lane> = keys
+            .into_iter()
+            .map(|key| {
+                let slices = ticks
+                    .iter()
+                    .map(|tick| {
+                        tick.iter()
+                            .find(|s| s.key == key)
+                            .map(|s| s.activity)
+                            .unwrap_or(AgentActivity::Idle)
+                    })
+                    .collect::<Vec<_>>();
+                let label = key.rsplit(':').next().unwrap_or(&key).to_string();
+                Lane { key, label, slices }
+            })
+            .collect();
+        // Order by recent activity (non-idle in the latest slices first), then cap.
+        lanes.sort_by_key(|l| {
+            let recent_active = l.slices.iter().rev().take(8)
+                .filter(|a| **a != AgentActivity::Idle).count();
+            std::cmp::Reverse(recent_active)
+        });
+        lanes.truncate(max_lanes);
+        lanes
     }
 
     #[cfg(test)]
@@ -302,5 +344,27 @@ mod tests {
         h.push(&snap(0, vec![session("a", 0, true)]));
         h.push(&snap(1, vec![session("a", 500, true)]));
         assert_eq!(h.last_agents().unwrap()[0].activity, AgentActivity::Output);
+    }
+
+    #[test]
+    fn lanes_one_per_agent_oldest_to_newest_idle_filled() {
+        let mut h = MetricsHistory::new(8);
+        h.push(&snap(0, vec![session("a", 0, true)]));                 // a: Thinking
+        h.push(&snap(1, vec![session("a", 100, true), session("b", 0, true)])); // a: Output, b: Thinking (first sight → delta 0)
+        let lanes = h.lanes(10);
+        let a = lanes.iter().find(|l| l.key.ends_with("a")).expect("lane a");
+        assert_eq!(a.slices.len(), 2, "one slice per tick");
+        assert_eq!(a.slices[1], AgentActivity::Output);
+        let b = lanes.iter().find(|l| l.key.ends_with("b")).expect("lane b");
+        // b absent in tick 0 → idle-filled
+        assert_eq!(b.slices.len(), 2);
+        assert_eq!(b.slices[0], AgentActivity::Idle);
+    }
+
+    #[test]
+    fn lanes_capped() {
+        let mut h = MetricsHistory::new(8);
+        h.push(&snap(0, vec![session("a",0,true), session("b",0,true), session("c",0,true)]));
+        assert!(h.lanes(2).len() <= 2);
     }
 }
