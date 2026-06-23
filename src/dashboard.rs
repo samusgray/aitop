@@ -1,5 +1,4 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
     io,
     sync::mpsc,
     thread,
@@ -35,7 +34,6 @@ use crate::{
 
 const INPUT_TICK: Duration = Duration::from_millis(75);
 const REFRESH_TICK: Duration = Duration::from_millis(1000);
-const SKYLINE_FULL_SCALE_SCORE: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardSource {
@@ -52,197 +50,6 @@ enum KeyAction {
     Continue,
     Refresh,
     Quit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActivityTone {
-    Quiet,
-    Low,
-    Medium,
-    High,
-    Hot,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ActivitySample {
-    score: u32,
-    tone: ActivityTone,
-}
-
-impl ActivitySample {
-    fn new(score: u32, tone: ActivityTone) -> Self {
-        Self { score, tone }
-    }
-
-    fn quiet() -> Self {
-        Self::new(0, ActivityTone::Quiet)
-    }
-}
-
-struct ActivitySkyline {
-    samples: VecDeque<ActivitySample>,
-    capacity: usize,
-}
-
-impl ActivitySkyline {
-    fn new(capacity: usize) -> Self {
-        Self {
-            samples: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn push_snapshot(&mut self, snapshot: &AmbientSnapshot, scorer: &mut ActivityScorer) {
-        self.push_sample(scorer.score(snapshot));
-    }
-
-    fn push_sample(&mut self, sample: ActivitySample) {
-        if self.samples.len() == self.capacity {
-            self.samples.pop_front();
-        }
-        self.samples.push_back(sample);
-    }
-
-    #[cfg(test)]
-    fn push_score(&mut self, score: u32) {
-        self.push_sample(ActivitySample::new(score, tone_for_score(score)));
-    }
-
-    #[cfg(test)]
-    fn scores(&self) -> Vec<u32> {
-        self.samples.iter().map(|sample| sample.score).collect()
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct ActivityScorer {
-    previous: BTreeMap<String, SessionObservation>,
-    previous_activity: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct SessionObservation {
-    status: SessionStatus,
-    cpu_percent: u32,
-    tokens_total: i64,
-    dirty_count: usize,
-    updated_at: Option<SystemTime>,
-}
-
-impl ActivityScorer {
-    fn score(&mut self, snapshot: &AmbientSnapshot) -> ActivitySample {
-        let current = snapshot
-            .sessions
-            .iter()
-            .map(|session| (session_key(session), observe_session(session)))
-            .collect::<BTreeMap<_, _>>();
-        if self.previous.is_empty() {
-            self.previous = current;
-            self.previous_activity = snapshot.activity.clone();
-            return ActivitySample::quiet();
-        }
-
-        let mut score = 0;
-        let mut hot = false;
-
-        for (key, observation) in &current {
-            match self.previous.get(key) {
-                Some(previous) => {
-                    let cpu_delta = observation.cpu_percent.abs_diff(previous.cpu_percent);
-                    if cpu_delta >= 60 {
-                        hot = true;
-                    }
-                    score += (cpu_delta / 10).min(8);
-
-                    let token_delta = observation
-                        .tokens_total
-                        .saturating_sub(previous.tokens_total)
-                        .max(0) as u32;
-                    score += (token_delta / 2_000).min(10);
-                    if token_delta >= 10_000 {
-                        hot = true;
-                    }
-
-                    if observation.updated_at != previous.updated_at {
-                        score += 3;
-                    }
-                    if observation.dirty_count != previous.dirty_count {
-                        score += 4 + observation.dirty_count.abs_diff(previous.dirty_count) as u32;
-                    }
-                    if observation.status != previous.status {
-                        score += 6;
-                    }
-                }
-                None => {
-                    score += if observation.status == SessionStatus::Running {
-                        4
-                    } else {
-                        1
-                    };
-                }
-            }
-        }
-
-        for key in self.previous.keys() {
-            if !current.contains_key(key) {
-                score += 6;
-            }
-        }
-
-        if snapshot.activity != self.previous_activity
-            && snapshot
-                .activity
-                .iter()
-                .any(|line| line.contains("changed"))
-        {
-            score += 2;
-        }
-
-        self.previous = current;
-        self.previous_activity = snapshot.activity.clone();
-        let score = score.min(100);
-        let tone = if hot {
-            ActivityTone::Hot
-        } else {
-            tone_for_score(score)
-        };
-        ActivitySample::new(score, tone)
-    }
-}
-
-fn observe_session(session: &AgentSession) -> SessionObservation {
-    SessionObservation {
-        status: session.status,
-        cpu_percent: session
-            .process
-            .as_ref()
-            .map(|process| process.cpu_percent)
-            .unwrap_or(0),
-        tokens_total: session.tokens_total.unwrap_or(0),
-        dirty_count: session.dirty_count(),
-        updated_at: session.updated_at,
-    }
-}
-
-fn session_key(session: &AgentSession) -> String {
-    session.native_id.clone().unwrap_or_else(|| {
-        format!(
-            "{}:{}:{}",
-            session.agent,
-            session.cwd.display(),
-            session.pid.unwrap_or_default()
-        )
-    })
-}
-
-fn tone_for_score(score: u32) -> ActivityTone {
-    match score {
-        0 => ActivityTone::Quiet,
-        1..=3 => ActivityTone::Low,
-        4..=8 => ActivityTone::Medium,
-        9..=15 => ActivityTone::High,
-        _ => ActivityTone::Hot,
-    }
 }
 
 pub fn run(source: DashboardSource) -> Result<()> {
@@ -268,16 +75,15 @@ fn run_loop(
     spawn_snapshot_worker(source, snapshot_tx);
     let mut sampler = ProcessSampler::new();
     let mut snapshot = snapshot_for_source(source, 0, &mut sampler)?;
-    let mut skyline = ActivitySkyline::new(160);
-    let mut scorer = ActivityScorer::default();
-    skyline.push_snapshot(&snapshot, &mut scorer);
+    let mut history = crate::metrics::MetricsHistory::new(240);
+    history.push(&snapshot);
     let mut needs_draw = true;
     let last_feed_offset = std::cell::Cell::new(0usize);
 
     loop {
         while let Ok(next_snapshot) = snapshot_rx.try_recv() {
             snapshot = next_snapshot;
-            skyline.push_snapshot(&snapshot, &mut scorer);
+            history.push(&snapshot);
             needs_draw = true;
         }
 
@@ -294,7 +100,7 @@ fn run_loop(
                         selected,
                         mode: &mode,
                         filter,
-                        skyline: &skyline,
+                        history: &history,
                         last_feed_offset: &last_feed_offset,
                     },
                 )
@@ -317,10 +123,10 @@ fn run_loop(
                 KeyAction::Refresh => {
                     snapshot = snapshot_for_source(
                         source,
-                        skyline.samples.len() as u64 + 1,
+                        history.throughput_series().len() as u64 + 1,
                         &mut sampler,
                     )?;
-                    skyline.push_snapshot(&snapshot, &mut scorer);
+                    history.push(&snapshot);
                     needs_draw = true;
                 }
                 KeyAction::Continue => needs_draw = true,
@@ -464,7 +270,7 @@ struct DrawContext<'a> {
     selected: usize,
     mode: &'a ViewMode,
     filter: SessionFilter,
-    skyline: &'a ActivitySkyline,
+    history: &'a crate::metrics::MetricsHistory,
     last_feed_offset: &'a std::cell::Cell<usize>,
 }
 
@@ -478,7 +284,7 @@ fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
             context.sessions,
             context.selected,
             context.filter,
-            context.skyline,
+            context.history,
         ),
         ViewMode::Tail { scroll, follow } => draw_tail(
             frame,
@@ -488,107 +294,9 @@ fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
             *scroll,
             *follow,
             context.filter,
-            context.skyline,
+            context.history,
             context.last_feed_offset,
         ),
-    }
-}
-
-#[cfg(test)]
-fn skyline_rows(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<String> {
-    let columns = skyline_columns(skyline, width, height);
-    (0..height)
-        .map(|row| columns.iter().map(|column| column.cells[row]).collect())
-        .collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SkylineColumn {
-    cells: Vec<char>,
-    tone: ActivityTone,
-    colors: Vec<Color>,
-}
-
-fn skyline_columns(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<SkylineColumn> {
-    let mut samples = skyline
-        .samples
-        .iter()
-        .rev()
-        .take(width)
-        .copied()
-        .collect::<Vec<_>>();
-    samples.reverse();
-    let mut columns = Vec::with_capacity(width);
-    if samples.len() < width {
-        columns.extend((0..(width - samples.len())).map(|_| SkylineColumn {
-            cells: vec![' '; height],
-            tone: ActivityTone::Quiet,
-            colors: vec![color_for_tone(ActivityTone::Quiet); height],
-        }));
-    }
-
-    for sample in samples {
-        let level = if sample.score == 0 {
-            0
-        } else {
-            (sample.score as usize * height)
-                .div_ceil(SKYLINE_FULL_SCALE_SCORE)
-                .clamp(1, height)
-        };
-        let mut cells = Vec::with_capacity(height);
-        let mut colors = Vec::with_capacity(height);
-        for row in 0..height {
-            if height - row <= level {
-                cells.push('▪');
-                colors.push(color_for_layer(height - row, height, sample.tone));
-            } else {
-                cells.push(' ');
-                colors.push(color_for_tone(ActivityTone::Quiet));
-            }
-        }
-        columns.push(SkylineColumn {
-            cells,
-            tone: sample.tone,
-            colors,
-        });
-    }
-    columns
-}
-
-fn skyline_lines(skyline: &ActivitySkyline, width: usize, height: usize) -> Vec<Line<'static>> {
-    let columns = skyline_columns(skyline, width, height);
-    let mut rows = Vec::with_capacity(height);
-
-    for row in 0..height {
-        let mut spans = Vec::with_capacity(columns.len());
-        for column in &columns {
-            spans.push(Span::styled(
-                column.cells[row].to_string(),
-                Style::default().fg(column.colors[row]),
-            ));
-        }
-        rows.push(Line::from(spans));
-    }
-    rows
-}
-
-fn color_for_layer(layer: usize, height: usize, tone: ActivityTone) -> Color {
-    let pct = (layer * 100) / height.max(1);
-    match (tone, pct) {
-        (ActivityTone::Hot, 76..=100) => Color::Red,
-        (_, 0..=35) => Color::Rgb(90, 170, 110),
-        (_, 36..=70) => Color::Rgb(190, 210, 110),
-        _ => Color::Rgb(230, 170, 80),
-    }
-}
-
-fn color_for_tone(tone: ActivityTone) -> Color {
-    match tone {
-        ActivityTone::Quiet => Color::DarkGray,
-        ActivityTone::Low => Color::Rgb(80, 150, 100),
-        ActivityTone::Medium => Color::Green,
-        ActivityTone::High => Color::Yellow,
-        ActivityTone::Hot => Color::Red,
     }
 }
 
@@ -598,16 +306,16 @@ fn draw_monitor(
     sessions: &[AgentSession],
     selected: usize,
     filter: SessionFilter,
-    skyline: &ActivitySkyline,
+    history: &crate::metrics::MetricsHistory,
 ) {
     let compact = frame.area().height < 32;
-    let skyline_height = if compact { 5 } else { 7 };
+    let panel_height = if compact { 5 } else { 7 };
     let activity_height = if compact { 5 } else { 7 };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(skyline_height),
+            Constraint::Length(panel_height),
             Constraint::Min(9),
             Constraint::Length(activity_height),
             Constraint::Length(2),
@@ -616,7 +324,7 @@ fn draw_monitor(
 
     frame.render_widget(Clear, vertical[0]);
     frame.render_widget(header(snapshot, filter), vertical[0]);
-    render_skyline(frame, skyline, vertical[1]);
+    render_throughput(frame, history, vertical[1]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
@@ -636,22 +344,7 @@ fn draw_monitor(
     }
 }
 
-fn render_skyline(frame: &mut Frame<'_>, skyline: &ActivitySkyline, area: Rect) {
-    frame.render_widget(Clear, area);
-    let inner_width = area.width.saturating_sub(4) as usize;
-    let rows = skyline_lines(skyline, inner_width, area.height.saturating_sub(2) as usize);
-    frame.render_widget(
-        Paragraph::new(rows).block(
-            Block::default()
-                .title(Line::from(vec![Span::styled(
-                    " agent activity ",
-                    title_style(),
-                )]))
-                .borders(Borders::ALL),
-        ),
-        area,
-    );
-}
+fn render_throughput(_frame: &mut Frame, _history: &crate::metrics::MetricsHistory, _area: Rect) {}
 
 fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'static> {
     let status = if snapshot.active_count() == 0 {
@@ -727,7 +420,7 @@ fn session_table(
     )
 }
 
-fn session_row(session: &AgentSession, now: std::time::SystemTime) -> Line<'static> {
+fn session_row(session: &AgentSession, now: SystemTime) -> Line<'static> {
     let marker = match session.status {
         SessionStatus::Running => "*",
         SessionStatus::Recent | SessionStatus::Done => "+",
@@ -951,7 +644,7 @@ fn draw_tail(
     scroll: usize,
     follow: bool,
     filter: SessionFilter,
-    skyline: &ActivitySkyline,
+    history: &crate::metrics::MetricsHistory,
     last_feed_offset: &std::cell::Cell<usize>,
 ) {
     let vertical = Layout::default()
@@ -966,8 +659,9 @@ fn draw_tail(
     frame.render_widget(Clear, body[0]);
     frame.render_widget(tail_sidebar(sessions, selected, filter), body[0]);
     let selected_session = sessions.get(selected);
-    let feed = selected_session
-        .and_then(|session| load_feed_for_session(source, session, skyline.samples.len() as u64));
+    let feed = selected_session.and_then(|session| {
+        load_feed_for_session(source, session, history.throughput_series().len() as u64)
+    });
     let viewport = body[1].height.saturating_sub(2) as usize;
     frame.render_widget(Clear, body[1]);
     frame.render_widget(
@@ -1441,7 +1135,7 @@ fn status_style(status: SessionStatus) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentKind, AgentSession, ProcessStats};
+    use crate::model::{AgentKind, AgentSession};
 
     #[test]
     fn tail_up_down_changes_selected_session_and_resets_scroll() {
@@ -1539,133 +1233,6 @@ mod tests {
     }
 
     #[test]
-    fn skyline_rolls_scores_and_discards_oldest_columns() {
-        let mut skyline = ActivitySkyline::new(3);
-
-        skyline.push_score(1);
-        skyline.push_score(2);
-        skyline.push_score(3);
-        skyline.push_score(4);
-
-        assert_eq!(skyline.scores(), vec![2, 3, 4]);
-    }
-
-    #[test]
-    fn skyline_turns_activity_scores_into_dot_grid() {
-        let mut skyline = ActivitySkyline::new(8);
-        skyline.push_sample(ActivitySample::quiet());
-        skyline.push_sample(ActivitySample::new(2, ActivityTone::Low));
-        skyline.push_sample(ActivitySample::new(4, ActivityTone::Medium));
-
-        let rows = skyline_rows(&skyline, 3, 3);
-
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], "   ");
-        assert_eq!(rows[1], "   ");
-        assert_eq!(rows[2], " ▪▪");
-    }
-
-    #[test]
-    fn skyline_scores_deltas_not_static_load() {
-        let mut session = test_session("live", SessionStatus::Running, "/repo", 40);
-        session.process = Some(ProcessStats {
-            cpu_percent: 10,
-            memory_bytes: 128 * 1024 * 1024,
-            child_pids: vec![1],
-        });
-        session.tokens_total = Some(10_000);
-
-        let first = AmbientSnapshot {
-            sessions: vec![session.clone()],
-            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(45),
-            activity: vec![],
-        };
-        let unchanged = AmbientSnapshot {
-            sessions: vec![session.clone()],
-            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(46),
-            activity: vec![],
-        };
-        session.process.as_mut().unwrap().cpu_percent = 80;
-        session.tokens_total = Some(16_000);
-        session.updated_at = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(47));
-        let changed = AmbientSnapshot {
-            sessions: vec![session],
-            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(47),
-            activity: vec!["changed M src/lib.rs".to_string()],
-        };
-
-        let mut scorer = ActivityScorer::default();
-
-        let warmup = scorer.score(&first);
-        let quiet = scorer.score(&unchanged);
-        let active = scorer.score(&changed);
-
-        assert_eq!(warmup, ActivitySample::quiet());
-        assert_eq!(quiet.score, 0);
-        assert!(active.score > quiet.score);
-        assert!(matches!(
-            active.tone,
-            ActivityTone::High | ActivityTone::Hot
-        ));
-    }
-
-    #[test]
-    fn skyline_ignores_repeated_stale_activity_lines() {
-        let mut session = test_session("live", SessionStatus::Running, "/repo", 40);
-        session.process = Some(ProcessStats {
-            cpu_percent: 0,
-            memory_bytes: 128 * 1024 * 1024,
-            child_pids: vec![],
-        });
-        let first = AmbientSnapshot {
-            sessions: vec![session.clone()],
-            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(45),
-            activity: vec!["11:27:15 changed M src/lib.rs".to_string()],
-        };
-        let repeated = AmbientSnapshot {
-            sessions: vec![session],
-            generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(46),
-            activity: vec!["11:27:15 changed M src/lib.rs".to_string()],
-        };
-
-        let mut scorer = ActivityScorer::default();
-
-        assert_eq!(scorer.score(&first), ActivitySample::quiet());
-        assert_eq!(scorer.score(&repeated), ActivitySample::quiet());
-    }
-
-    #[test]
-    fn skyline_uses_absolute_scale_for_low_scores() {
-        let mut skyline = ActivitySkyline::new(8);
-        skyline.push_sample(ActivitySample::new(2, ActivityTone::Low));
-
-        let rows = skyline_rows(&skyline, 1, 5);
-
-        assert_eq!(rows, vec![" ", " ", " ", " ", "▪"]);
-    }
-
-    #[test]
-    fn skyline_render_preserves_tone_for_colored_columns() {
-        let mut skyline = ActivitySkyline::new(8);
-        skyline.push_sample(ActivitySample::new(1, ActivityTone::Low));
-        skyline.push_sample(ActivitySample::new(5, ActivityTone::Medium));
-        skyline.push_sample(ActivitySample::new(9, ActivityTone::High));
-        skyline.push_sample(ActivitySample::new(14, ActivityTone::Hot));
-
-        let columns = skyline_columns(&skyline, 4, 3);
-
-        assert_eq!(
-            columns.iter().map(|column| column.tone).collect::<Vec<_>>(),
-            vec![
-                ActivityTone::Low,
-                ActivityTone::Medium,
-                ActivityTone::High,
-                ActivityTone::Hot
-            ]
-        );
-    }
-
-    #[test]
     fn feed_record_lines_use_aitail_style_badges_and_result_panels() {
         let error = FeedRecord {
             session_id: "auth-service".to_string(),
@@ -1703,21 +1270,6 @@ mod tests {
         // Can't scroll past total - viewport.
         assert_eq!(super::feed_scroll_offset(false, 999, 100, 20), 80);
         assert_eq!(super::feed_scroll_offset(false, 25, 100, 20), 25);
-    }
-
-    #[test]
-    fn skyline_columns_use_one_pixel_glyph_not_punctuation_bands() {
-        let mut skyline = ActivitySkyline::new(4);
-        skyline.push_sample(ActivitySample::new(8, ActivityTone::Low));
-        skyline.push_sample(ActivitySample::new(14, ActivityTone::Hot));
-
-        let rows = skyline_rows(&skyline, 2, 4).join("\n");
-
-        assert!(rows.contains('▪'));
-        assert!(!rows.contains('.'));
-        assert!(!rows.contains(':'));
-        assert!(!rows.contains('*'));
-        assert!(!rows.contains('#'));
     }
 
     fn tail_scroll(mode: &ViewMode) -> Option<usize> {
