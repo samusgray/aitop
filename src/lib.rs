@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod diffview;
 pub mod feed;
 pub mod git;
+pub mod metrics;
 pub mod model;
 pub mod pricing;
 pub mod process;
