@@ -1,6 +1,7 @@
 pub mod app;
 pub mod codex;
 pub mod dashboard;
+pub mod diffview;
 pub mod feed;
 pub mod git;
 pub mod model;
