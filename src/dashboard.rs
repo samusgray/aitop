@@ -614,11 +614,14 @@ fn spectrum_energy(history: &crate::metrics::MetricsHistory) -> f32 {
     let live = global.map(|g| g.live).unwrap_or(0) as f32;
     let cpu = history.latest_cpu_total() as f32;
 
-    let tps_term = (tps / 350.0).min(1.0);
-    let cpu_term = (cpu / 110.0).min(1.0);
-    let live_term = (live / 3.0).min(1.0);
-    const BASELINE: f32 = 0.55;
-    (BASELINE + 0.45 * tps_term + 0.40 * cpu_term + 0.20 * live_term).min(1.0)
+    let _ = live;
+    // Real work, not mere existence, drives the spectrum: token throughput is the
+    // dominant signal, with live-agent CPU as a secondary pulse. A tiny baseline
+    // keeps a faint flat line rather than a dead box; at true idle it barely moves.
+    let tps_term = (tps / 250.0).min(1.0);
+    let cpu_term = (cpu / 150.0).min(1.0);
+    const BASELINE: f32 = 0.04;
+    (BASELINE + 0.78 * tps_term + 0.28 * cpu_term).min(1.0)
 }
 
 fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'static> {

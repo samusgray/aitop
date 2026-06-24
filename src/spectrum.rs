@@ -38,8 +38,9 @@ impl Spectrum {
 
         // Smoothly approach the target energy so jumps in activity ease in.
         self.energy += (target_energy - self.energy) * (1.0 - (-dt * 5.0).exp());
-        // Phase scrolls faster when the swarm is busy.
-        self.phase += dt * (0.6 + self.energy * 3.0);
+        // Phase barely scrolls at idle and speeds up sharply with activity, so a
+        // quiet system looks quiet rather than perpetually in motion.
+        self.phase += dt * (0.12 + self.energy * 4.0);
 
         let n = self.heights.len() as f32;
         for i in 0..self.heights.len() {
