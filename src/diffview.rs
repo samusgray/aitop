@@ -165,6 +165,28 @@ pub fn render_file_edit(path: &str, hunks: &[FileEditHunk], width: usize) -> Vec
     rendered
 }
 
+/// The 1-based line where a hunk begins in the actual file on disk, so diffs can
+/// show real file line numbers. After an edit is applied the file holds the new
+/// text, so we locate `new_text`; fall back to `old_text`, then to 1 (relative
+/// numbering) if the file is unreadable or the snippet no longer matches.
+fn locate_base(path: &str, hunk: &FileEditHunk) -> usize {
+    let needle = if !hunk.new_text.is_empty() {
+        &hunk.new_text
+    } else {
+        &hunk.old_text
+    };
+    if needle.is_empty() {
+        return 1;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 1;
+    };
+    match content.find(needle) {
+        Some(idx) => content[..idx].bytes().filter(|&b| b == b'\n').count() + 1,
+        None => 1,
+    }
+}
+
 fn render_file_edit_uncached(path: &str, hunks: &[FileEditHunk], width: usize) -> Vec<Line<'static>> {
     let (syntaxes, theme) = assets();
     let syntax = syntaxes
@@ -183,10 +205,17 @@ fn render_file_edit_uncached(path: &str, hunks: &[FileEditHunk], width: usize) -
     ]));
 
     for hunk in hunks {
+        // Number the diff from the hunk's real position in the file rather than
+        // from 1, so it lines up with editor / Claude Code line numbers.
+        let base = locate_base(path, hunk);
         let (lines, hidden) = collapse(diff_hunk(&hunk.old_text, &hunk.new_text), MAX_DIFF_LINES);
         for diff_line in &lines {
             let bg = row_bg(diff_line.kind);
-            let number = diff_line.new_no.or(diff_line.old_no).unwrap_or(0);
+            let number = diff_line
+                .new_no
+                .or(diff_line.old_no)
+                .map(|n| base - 1 + n)
+                .unwrap_or(0);
             let text: String = diff_line.segs.iter().map(|s| s.text.as_str()).collect();
 
             let mut spans = Vec::new();
@@ -281,6 +310,29 @@ mod tests {
 
     fn cache_len() -> usize {
         super::cache().lock().unwrap().len()
+    }
+
+    #[test]
+    fn locate_base_finds_real_line_number() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.rs");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "line1\nline2\nTARGET line\nline4\n").unwrap();
+        let hunk = crate::feed::FileEditHunk {
+            old_text: String::new(),
+            new_text: "TARGET line".to_string(),
+        };
+        assert_eq!(locate_base(path.to_str().unwrap(), &hunk), 3);
+    }
+
+    #[test]
+    fn locate_base_falls_back_to_one_when_missing() {
+        let hunk = crate::feed::FileEditHunk {
+            old_text: "x".to_string(),
+            new_text: "NOT IN ANY FILE".to_string(),
+        };
+        assert_eq!(locate_base("/no/such/path/nope.rs", &hunk), 1);
     }
 
     #[test]
