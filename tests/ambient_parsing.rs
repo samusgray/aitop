@@ -622,7 +622,6 @@ fn text_summary_uses_overview_default() {
     let snapshot = AmbientSnapshot {
         sessions: vec![recent, running],
         generated_at: std::time::SystemTime::UNIX_EPOCH,
-        activity: vec![],
     };
 
     let summary = snapshot.text_summary();
@@ -693,7 +692,6 @@ fn demo_snapshots_change_over_time() {
             .filter_map(|session| session.tokens_total)
             .collect::<Vec<_>>()
     );
-    assert_ne!(first.activity, later.activity);
 }
 
 #[test]

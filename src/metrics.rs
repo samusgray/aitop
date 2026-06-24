@@ -267,7 +267,6 @@ mod tests {
         AmbientSnapshot {
             sessions,
             generated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(at),
-            activity: Vec::new(),
         }
     }
 

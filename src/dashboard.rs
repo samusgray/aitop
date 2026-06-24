@@ -964,7 +964,9 @@ pub fn render_swimlane(
     // label column + 1 space separator; bar gets the rest
     let bar_width = inner_width.saturating_sub(LABEL_WIDTH + 1);
 
-    let lanes = history.lanes(inner_height);
+    // Fetch all lanes so the overflow count below is real; truncating to
+    // inner_height here would make "+N more" impossible to compute.
+    let lanes = history.lanes(usize::MAX);
     let total = lanes.len();
 
     // Reserve a row for "+N more" only when lanes overflow
@@ -1761,7 +1763,6 @@ pub(crate) fn tests_support_snapshot(at: u64) -> crate::app::AmbientSnapshot {
         sessions: vec![s],
         generated_at: std::time::SystemTime::UNIX_EPOCH
             + std::time::Duration::from_secs(at),
-        activity: Vec::new(),
     }
 }
 

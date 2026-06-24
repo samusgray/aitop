@@ -21,7 +21,6 @@ use crate::{
 pub struct AmbientSnapshot {
     pub sessions: Vec<AgentSession>,
     pub generated_at: SystemTime,
-    pub activity: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,11 +230,9 @@ pub fn demo_snapshot(tick: u64) -> AmbientSnapshot {
             .cmp(&a.status.eq(&SessionStatus::Running))
             .then_with(|| b.updated_at.cmp(&a.updated_at))
     });
-    let activity = demo_activity(&sessions, tick);
     AmbientSnapshot {
         sessions,
         generated_at: now,
-        activity,
     }
 }
 
@@ -645,41 +642,6 @@ fn usage(id: &str, input: u64, output: u64) -> FeedRecord {
     )
 }
 
-fn demo_activity(sessions: &[AgentSession], tick: u64) -> Vec<String> {
-    sessions
-        .iter()
-        .take(8)
-        .enumerate()
-        .map(|(index, session)| {
-            let cpu = session
-                .process
-                .as_ref()
-                .map(|process| process.cpu_percent)
-                .unwrap_or(0);
-            if (tick + index as u64).is_multiple_of(4) {
-                format!(
-                    "{} changed M src/{}/file-{}.rs",
-                    crate::model::time_label(session.updated_at),
-                    session.repo_name(),
-                    tick % 5
-                )
-            } else {
-                format!(
-                    "{} sampled cpu {}% mem {} - {}",
-                    crate::model::time_label(session.updated_at),
-                    cpu,
-                    session
-                        .process
-                        .as_ref()
-                        .map(|process| format_bytes(process.memory_bytes))
-                        .unwrap_or_else(|| "-".to_string()),
-                    session.agent
-                )
-            }
-        })
-        .collect()
-}
-
 pub fn snapshot_with_sampler(sampler: &mut ProcessSampler) -> Result<AmbientSnapshot> {
     let mut sessions = Vec::new();
 
@@ -712,12 +674,10 @@ pub fn snapshot_with_sampler(sampler: &mut ProcessSampler) -> Result<AmbientSnap
             .then_with(|| b.updated_at.cmp(&a.updated_at))
     });
     sessions.truncate(30);
-    let activity = activity_lines(&sessions);
 
     Ok(AmbientSnapshot {
         sessions,
         generated_at: SystemTime::now(),
-        activity,
     })
 }
 
@@ -824,44 +784,6 @@ pub fn policy_for_missing_processes(sessions: &mut [AgentSession]) {
             session.status = SessionStatus::Recent;
         }
     }
-}
-
-fn activity_lines(sessions: &[AgentSession]) -> Vec<String> {
-    let mut lines = Vec::new();
-    for session in sessions.iter().take(12) {
-        let agent = match session.agent {
-            AgentKind::Claude => "claude",
-            AgentKind::Codex => "codex",
-        };
-        if let Some(process) = &session.process {
-            lines.push(format!(
-                "{} sampled cpu {}% mem {} - {}",
-                crate::model::time_label(session.updated_at),
-                process.cpu_percent,
-                format_bytes(process.memory_bytes),
-                agent
-            ));
-        } else {
-            lines.push(format!(
-                "{} observed {} - {}",
-                crate::model::time_label(session.updated_at),
-                session.status,
-                agent
-            ));
-        }
-        if let Some(git) = &session.git {
-            for dirty in git.dirty_files.iter().take(2) {
-                lines.push(format!(
-                    "{} changed {} {}",
-                    crate::model::time_label(session.updated_at),
-                    dirty.code,
-                    dirty.path
-                ));
-            }
-        }
-    }
-    lines.truncate(12);
-    lines
 }
 
 pub fn format_bytes(bytes: u64) -> String {
