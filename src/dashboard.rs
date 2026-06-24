@@ -626,7 +626,7 @@ fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'stati
         "idle".to_string()
     } else {
         format!(
-            "{} active - {} tracked",
+            "{} active · {} tracked",
             snapshot.active_count(),
             snapshot.sessions.len()
         )
@@ -638,16 +638,12 @@ fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'stati
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("AI AGENT MONITOR", dim()),
-        Span::raw("  "),
-        Span::styled("native ambient sources", Style::default().fg(Color::Gray)),
         Span::raw("  "),
         Span::styled(status, Style::default().fg(Color::Gray)),
-        Span::raw("  "),
-        Span::styled(format!("filter: {} ", filter.label()), dim()),
-        Span::raw("  "),
-        Span::styled("live ", Style::default().fg(Color::Green)),
-        Span::styled(time_label(Some(snapshot.generated_at)), strong()),
+        Span::raw("   "),
+        Span::styled(filter.label().to_string(), dim()),
+        Span::raw("   "),
+        Span::styled(time_label(Some(snapshot.generated_at)), dim()),
     ]))
     .block(Block::default().borders(Borders::BOTTOM))
 }
