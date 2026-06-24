@@ -1,82 +1,65 @@
-//! A spectroscope-style bar animator for the agent-activity panel.
+//! An oscilloscope-style waveform animator for the agent-activity panel.
 //!
-//! Bars rise quickly toward a target derived from live agent "energy" and fall
-//! with gravity, with floating peak caps — like a classic audio EQ visualizer.
-//! It is ticked every render frame (not just on data refresh) so the spectrum
-//! stays alive and dances even between the ~1s snapshot updates.
-
-/// A fixed, generous bar count; the renderer samples the first `width` of these.
-pub const BARS: usize = 256;
+//! Modelled on `scope-tui`'s amplitude scope: a flowing waveform rendered with
+//! braille sub-cell points and a magenta→white gradient. It is driven by live
+//! agent "energy" — a near-flat line when the system is idle, a rich, fast
+//! scrolling waveform when agents are actively working — and is advanced every
+//! render frame so motion is smooth.
 
 pub struct Spectrum {
-    heights: Vec<f32>,
-    peaks: Vec<f32>,
     phase: f32,
     energy: f32,
 }
 
+impl Default for Spectrum {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Spectrum {
-    pub fn new(bars: usize) -> Self {
-        let bars = bars.max(1);
+    pub fn new() -> Self {
         Self {
-            heights: vec![0.0; bars],
-            peaks: vec![0.0; bars],
             phase: 0.0,
             energy: 0.0,
         }
-    }
-
-    pub fn bars(&self) -> usize {
-        self.heights.len()
     }
 
     /// Advance one frame. `target_energy` is overall agent activity in `0..=1`;
     /// `dt` is the frame time in seconds.
     pub fn tick(&mut self, target_energy: f32, dt: f32) {
         let dt = dt.clamp(0.0, 0.25);
-        let target_energy = target_energy.clamp(0.0, 1.0);
-
-        // Smoothly approach the target energy so jumps in activity ease in.
-        self.energy += (target_energy - self.energy) * (1.0 - (-dt * 5.0).exp());
-        // Phase barely scrolls at idle and speeds up sharply with activity, so a
-        // quiet system looks quiet rather than perpetually in motion.
-        self.phase += dt * (0.12 + self.energy * 4.0);
-
-        let n = self.heights.len() as f32;
-        for i in 0..self.heights.len() {
-            let x = i as f32;
-            // A slow swell times a faster "bar" component: neighbouring bars differ
-            // and valleys open up between them like a classic EQ.
-            let a = 0.55 + 0.45 * (x * 0.27 + self.phase).sin();
-            let b = 0.50 + 0.50 * (x * 0.85 - self.phase * 0.5).sin();
-            // Low "frequencies" (left) carry a touch more energy, like real audio.
-            let env = 1.0 - 0.4 * (x / n);
-            let target = (self.energy * a * b * env).clamp(0.0, 1.0);
-
-            if target > self.heights[i] {
-                // Snap up toward the target.
-                self.heights[i] += (target - self.heights[i]) * (1.0 - (-dt * 20.0).exp());
-            } else {
-                // Fall under gravity.
-                self.heights[i] = (self.heights[i] - dt * 0.9).max(0.0);
-            }
-
-            if self.heights[i] > self.peaks[i] {
-                self.peaks[i] = self.heights[i];
-            } else {
-                // Peak caps drift down slowly, never below the bar.
-                self.peaks[i] = (self.peaks[i] - dt * 0.45).max(self.heights[i]);
-            }
-        }
+        let target = target_energy.clamp(0.0, 1.0);
+        // Ease toward the target so activity changes glide in.
+        self.energy += (target - self.energy) * (1.0 - (-dt * 4.0).exp());
+        // Scroll speed rises sharply with activity: near-still at idle, fast when busy.
+        self.phase += dt * (0.4 + self.energy * 22.0);
     }
 
-    pub fn heights(&self) -> &[f32] {
-        &self.heights
+    pub fn energy(&self) -> f32 {
+        self.energy
     }
 
-    pub fn peaks(&self) -> &[f32] {
-        &self.peaks
+    /// Waveform amplitude in `-1..=1` at horizontal column `i` of `width`.
+    /// Scrolls right→left as the phase advances; flat when energy is ~0.
+    pub fn sample(&self, i: usize, width: usize) -> f32 {
+        let n = width.max(1) as f32;
+        let t = (i as f32 / n) * 38.0 - self.phase;
+        // Layered sines give a quasi-periodic, audio-like waveform.
+        let wave = 0.55 * t.sin()
+            + 0.28 * (t * 2.7 + 0.6).sin()
+            + 0.20 * (t * 6.3).sin()
+            + 0.12 * (t * 11.1).sin();
+        // Deterministic jitter scatters the braille points for that dense texture.
+        let jitter = pseudo_noise(t * 12.0) * 0.10;
+        (self.energy * (wave + jitter)).clamp(-1.0, 1.0)
     }
+}
+
+/// Cheap deterministic value noise in `-1..=1`.
+fn pseudo_noise(x: f32) -> f32 {
+    let s = (x * 127.1).sin() * 43758.547;
+    (s - s.floor()) * 2.0 - 1.0
 }
 
 #[cfg(test)]
@@ -84,37 +67,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn energy_raises_bars_over_time() {
-        let mut s = Spectrum::new(64);
-        for _ in 0..30 {
-            s.tick(1.0, 0.05);
+    fn idle_waveform_is_flat() {
+        let s = Spectrum::new();
+        for i in 0..50 {
+            assert!(s.sample(i, 50).abs() < 1e-6, "idle should be flat");
         }
-        let max = s.heights().iter().cloned().fold(0.0_f32, f32::max);
-        assert!(max > 0.2, "sustained energy should raise some bars, got {max}");
     }
 
     #[test]
-    fn bars_decay_toward_zero_without_energy() {
-        let mut s = Spectrum::new(64);
-        for _ in 0..20 {
+    fn energy_produces_a_visible_waveform() {
+        let mut s = Spectrum::new();
+        for _ in 0..40 {
             s.tick(1.0, 0.05);
         }
-        for _ in 0..200 {
-            s.tick(0.0, 0.05);
-        }
-        let max = s.heights().iter().cloned().fold(0.0_f32, f32::max);
-        assert!(max < 0.05, "bars should fall to ~0 under gravity, got {max}");
+        let visible = (0..80).any(|i| s.sample(i, 80).abs() > 0.1);
+        assert!(visible, "active energy should produce a waveform");
     }
 
     #[test]
-    fn heights_stay_in_unit_range_and_peaks_lead() {
-        let mut s = Spectrum::new(64);
-        for _ in 0..50 {
-            s.tick(0.8, 0.05);
+    fn samples_stay_in_unit_range() {
+        let mut s = Spectrum::new();
+        for _ in 0..60 {
+            s.tick(1.0, 0.05);
         }
-        for (h, p) in s.heights().iter().zip(s.peaks().iter()) {
-            assert!((0.0..=1.0).contains(h), "height in range: {h}");
-            assert!(*p >= *h - 1e-6, "peak >= height: {p} vs {h}");
+        for i in 0..120 {
+            let v = s.sample(i, 120);
+            assert!((-1.0..=1.0).contains(&v), "sample in range: {v}");
         }
     }
 }

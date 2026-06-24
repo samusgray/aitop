@@ -96,7 +96,7 @@ fn run_loop(
     let mut mode = ViewMode::Monitor;
     let mut filter = SessionFilter::Overview;
     let mut top_panel = TopPanel::Spectrum;
-    let mut spectrum = crate::spectrum::Spectrum::new(crate::spectrum::BARS);
+    let mut spectrum = crate::spectrum::Spectrum::new();
     let (snapshot_tx, snapshot_rx) = mpsc::channel();
     spawn_snapshot_worker(source, snapshot_tx);
     let mut sampler = ProcessSampler::new();
@@ -547,62 +547,74 @@ fn draw_monitor(
 }
 
 fn render_spectrum(frame: &mut Frame<'_>, spectrum: &crate::spectrum::Spectrum, area: Rect) {
+    use ratatui::symbols::Marker;
+    use ratatui::widgets::canvas::{Canvas, Points};
+
     let block = Block::default()
-        .title(Line::from(Span::styled(" agent activity ", accent())))
+        .title(Line::from(vec![
+            Span::styled(" agent activity ", Style::default().fg(Color::Rgb(235, 90, 160))),
+            Span::styled("amplitude ", dim()),
+        ]))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(Style::default().fg(Color::Rgb(150, 50, 100)));
     let inner = block.inner(area);
-    frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
+        frame.render_widget(block, area);
         return;
     }
 
-    const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let w = inner.width as usize;
-    let h = inner.height as usize;
-    let heights = spectrum.heights();
-    let peaks = spectrum.peaks();
+    // Braille cells pack 2 dots horizontally; sample at that finer resolution.
+    let cols = (inner.width as usize) * 2;
+    let samples: Vec<f32> = (0..cols).map(|i| spectrum.sample(i, cols)).collect();
 
-    let mut lines: Vec<Line> = Vec::with_capacity(h);
-    for row in 0..h {
-        // Rows render top (row 0) to bottom; count cells up from the bottom.
-        let cell_from_bottom = (h - 1 - row) as i32;
-        let mut spans: Vec<Span> = Vec::with_capacity(w);
-        for col in 0..w {
-            let val = heights.get(col).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let peak = peaks.get(col).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let total_eighths = (val * h as f32 * 8.0).round() as i32;
-            let fill = (total_eighths - cell_from_bottom * 8).clamp(0, 8);
-            let peak_cell = ((peak * h as f32).ceil() as i32 - 1).max(0);
-
-            if fill == 0 {
-                if peak > 0.03 && cell_from_bottom == peak_cell {
-                    spans.push(Span::styled("▔", Style::default().fg(Color::Rgb(180, 220, 255))));
-                } else {
-                    spans.push(Span::raw(" "));
+    let canvas = Canvas::default()
+        .block(block)
+        .marker(Marker::Braille)
+        .x_bounds([0.0, cols as f64])
+        .y_bounds([-1.05, 1.05])
+        .paint(move |ctx| {
+            // A baseline so an idle scope reads as a faint flat line, not an empty box.
+            let baseline: Vec<(f64, f64)> = (0..cols).map(|i| (i as f64, 0.0)).collect();
+            ctx.draw(&Points {
+                coords: &baseline,
+                color: Color::Rgb(110, 40, 80),
+            });
+            for (i, &s) in samples.iter().enumerate() {
+                let amp = s.abs();
+                if amp < 0.02 {
+                    continue;
                 }
-                continue;
+                // Fill a vertical band from the centre to the sample for density,
+                // colouring each point by its height (magenta body → white peaks).
+                const STEPS: usize = 6;
+                let mut pts: [(f64, f64); STEPS] = [(0.0, 0.0); STEPS];
+                for (k, p) in pts.iter_mut().enumerate() {
+                    let y = s as f64 * (k as f64 / (STEPS - 1) as f64);
+                    *p = (i as f64, y);
+                }
+                ctx.draw(&Points {
+                    coords: &pts,
+                    color: scope_color(amp),
+                });
             }
-            let frac = (cell_from_bottom as f32 + 1.0) / h as f32;
-            spans.push(Span::styled(
-                BLOCKS[fill as usize].to_string(),
-                Style::default().fg(spectrum_level_color(frac)),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
+        });
+    frame.render_widget(canvas, area);
 }
 
-fn spectrum_level_color(frac: f32) -> Color {
-    // Classic EQ gradient: green low, yellow mid, red peaks.
-    if frac < 0.5 {
-        Color::Rgb(40, 200, 90)
-    } else if frac < 0.78 {
-        Color::Rgb(225, 205, 60)
+/// scope-tui-style gradient: magenta body → hot pink → near-white peaks.
+fn scope_color(amp: f32) -> Color {
+    let a = amp.clamp(0.0, 1.0);
+    if a < 0.5 {
+        lerp_rgb((150, 45, 110), (235, 75, 155), a / 0.5)
     } else {
-        Color::Rgb(235, 75, 60)
+        lerp_rgb((235, 75, 155), (255, 205, 230), (a - 0.5) / 0.5)
     }
+}
+
+fn lerp_rgb(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+    Color::Rgb(lerp(from.0, to.0), lerp(from.1, to.1), lerp(from.2, to.2))
 }
 
 /// Overall agent activity in 0..=1, driving the spectrum amplitude. Combines
@@ -615,13 +627,14 @@ fn spectrum_energy(history: &crate::metrics::MetricsHistory) -> f32 {
     let cpu = history.latest_cpu_total() as f32;
 
     let _ = live;
-    // Real work, not mere existence, drives the spectrum: token throughput is the
-    // dominant signal, with live-agent CPU as a secondary pulse. A tiny baseline
-    // keeps a faint flat line rather than a dead box; at true idle it barely moves.
-    let tps_term = (tps / 250.0).min(1.0);
-    let cpu_term = (cpu / 150.0).min(1.0);
-    const BASELINE: f32 = 0.04;
-    (BASELINE + 0.78 * tps_term + 0.28 * cpu_term).min(1.0)
+    // Real work, not mere existence, drives the scope: token throughput plus
+    // live-agent CPU. A perceptual curve makes any genuine activity fill the
+    // panel while a tiny baseline keeps a calm flat line at true idle.
+    let tps_term = (tps / 200.0).min(1.0);
+    let cpu_term = (cpu / 70.0).min(1.0);
+    const BASELINE: f32 = 0.07;
+    let raw = (BASELINE + 0.70 * tps_term + 0.60 * cpu_term).min(1.0);
+    raw.powf(0.6)
 }
 
 fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'static> {
@@ -1968,7 +1981,7 @@ mod tests {
     #[test]
     fn spectrum_renders_without_panicking() {
         use ratatui::{backend::TestBackend, Terminal};
-        let mut s = crate::spectrum::Spectrum::new(crate::spectrum::BARS);
+        let mut s = crate::spectrum::Spectrum::new();
         for _ in 0..20 {
             s.tick(0.8, 0.05);
         }
@@ -1987,7 +2000,7 @@ mod tests {
     #[test]
     fn spectrum_renders_at_tiny_size_without_panic() {
         use ratatui::{backend::TestBackend, Terminal};
-        let s = crate::spectrum::Spectrum::new(crate::spectrum::BARS);
+        let s = crate::spectrum::Spectrum::new();
         let mut term = Terminal::new(TestBackend::new(2, 2)).unwrap();
         term.draw(|f| super::render_spectrum(f, &s, f.area())).unwrap();
     }
