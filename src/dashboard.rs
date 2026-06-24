@@ -551,10 +551,10 @@ fn render_spectrum(frame: &mut Frame<'_>, spectrum: &crate::spectrum::Spectrum, 
     use ratatui::widgets::canvas::{Canvas, Points};
 
     let block = Block::default()
-        .title(Line::from(vec![
-            Span::styled(" agent activity ", Style::default().fg(Color::Rgb(235, 90, 160))),
-            Span::styled("amplitude ", dim()),
-        ]))
+        .title(Span::styled(
+            " agent activity ",
+            Style::default().fg(Color::Rgb(235, 90, 160)),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(150, 50, 100)));
     let inner = block.inner(area);
