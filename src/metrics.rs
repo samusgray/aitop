@@ -185,6 +185,15 @@ impl MetricsHistory {
         &self.projects
     }
 
+    /// Sum of CPU% across the most recent tick's agent samples — a lively
+    /// signal that fluctuates every refresh even when no tokens are flowing.
+    pub fn latest_cpu_total(&self) -> u32 {
+        self.agents
+            .back()
+            .map(|samples| samples.iter().map(|s| s.cpu_percent).sum())
+            .unwrap_or(0)
+    }
+
     pub fn lanes(&self, max_lanes: usize) -> Vec<Lane> {
         let ticks: Vec<&Vec<AgentSample>> = self.agents.iter().collect();
         let mut keys: Vec<String> = Vec::new();

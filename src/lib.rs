@@ -10,3 +10,4 @@ pub mod model;
 pub mod pricing;
 pub mod process;
 pub mod sources;
+pub mod spectrum;

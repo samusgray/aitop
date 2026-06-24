@@ -63,15 +63,15 @@ enum KeyAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopPanel {
-    Throughput,
+    Spectrum,
     Swimlane,
 }
 
 impl TopPanel {
     fn next(self) -> Self {
         match self {
-            TopPanel::Throughput => TopPanel::Swimlane,
-            TopPanel::Swimlane => TopPanel::Throughput,
+            TopPanel::Spectrum => TopPanel::Swimlane,
+            TopPanel::Swimlane => TopPanel::Spectrum,
         }
     }
 }
@@ -95,7 +95,8 @@ fn run_loop(
     let mut selected = 0usize;
     let mut mode = ViewMode::Monitor;
     let mut filter = SessionFilter::Overview;
-    let mut top_panel = TopPanel::Throughput;
+    let mut top_panel = TopPanel::Spectrum;
+    let mut spectrum = crate::spectrum::Spectrum::new(crate::spectrum::BARS);
     let (snapshot_tx, snapshot_rx) = mpsc::channel();
     spawn_snapshot_worker(source, snapshot_tx);
     let mut sampler = ProcessSampler::new();
@@ -112,6 +113,13 @@ fn run_loop(
             snapshot = next_snapshot;
             history.push(&snapshot);
             activity_index = crate::activity::ActivityIndex::build(&snapshot, 40, 500);
+            needs_draw = true;
+        }
+
+        // Animate the spectrum every frame while on the monitor so it dances
+        // between snapshot refreshes; this also keeps the monitor redrawing.
+        if matches!(mode, ViewMode::Monitor) {
+            spectrum.tick(spectrum_energy(&history), INPUT_TICK.as_secs_f32());
             needs_draw = true;
         }
 
@@ -133,6 +141,7 @@ fn run_loop(
                         last_stream_scroll: &last_stream_scroll,
                         activity_index: &activity_index,
                         top_panel,
+                        spectrum: &spectrum,
                     },
                 )
             })?;
@@ -436,6 +445,7 @@ struct DrawContext<'a> {
     last_stream_scroll: &'a std::cell::Cell<usize>,
     activity_index: &'a crate::activity::ActivityIndex,
     top_panel: TopPanel,
+    spectrum: &'a crate::spectrum::Spectrum,
 }
 
 fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
@@ -451,6 +461,7 @@ fn draw(frame: &mut Frame<'_>, context: DrawContext<'_>) {
             context.history,
             context.activity_index,
             context.top_panel,
+            context.spectrum,
         ),
         ViewMode::Tail { scroll, follow } => draw_tail(
             frame,
@@ -494,244 +505,120 @@ fn draw_monitor(
     history: &crate::metrics::MetricsHistory,
     activity_index: &crate::activity::ActivityIndex,
     top_panel: TopPanel,
+    spectrum: &crate::spectrum::Spectrum,
 ) {
     let compact = frame.area().height < 32;
-    let panel_height = if compact { 5 } else { 7 };
+    let panel_height = if compact { 6 } else { 11 };
     let activity_height = if compact { 5 } else { 7 };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),              // [0] header
-            Constraint::Length(panel_height),   // [1] throughput panel
-            Constraint::Length(1),              // [2] heat ribbon
-            Constraint::Min(9),                 // [3] main split
-            Constraint::Length(activity_height), // [4] activity
-            Constraint::Length(2),              // [5] footer
+            Constraint::Length(3),               // [0] header
+            Constraint::Length(panel_height),    // [1] agent-activity panel
+            Constraint::Min(9),                  // [2] main split
+            Constraint::Length(activity_height), // [3] activity stream preview
+            Constraint::Length(2),               // [4] footer
         ])
         .split(frame.area());
 
     frame.render_widget(Clear, vertical[0]);
     frame.render_widget(header(snapshot, filter), vertical[0]);
     match top_panel {
-        TopPanel::Throughput => render_throughput(frame, history, vertical[1]),
+        TopPanel::Spectrum => render_spectrum(frame, spectrum, vertical[1]),
         TopPanel::Swimlane => render_swimlane(frame, history, vertical[1]),
     }
-    render_heat_ribbon(frame, history, vertical[2]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(61), Constraint::Percentage(39)])
-        .split(vertical[3]);
+        .split(vertical[2]);
 
     frame.render_widget(Clear, main[0]);
     frame.render_widget(session_table(snapshot, sessions, selected, filter), main[0]);
     frame.render_widget(Clear, main[1]);
     frame.render_widget(session_detail(sessions.get(selected)), main[1]);
-    render_activity_preview(frame, activity_index, vertical[4]);
-    frame.render_widget(Clear, vertical[5]);
-    frame.render_widget(monitor_footer(), vertical[5]);
+    render_activity_preview(frame, activity_index, vertical[3]);
+    frame.render_widget(Clear, vertical[4]);
+    frame.render_widget(monitor_footer(), vertical[4]);
 
     if sessions.is_empty() {
         draw_empty_state(frame, main[0]);
     }
 }
 
-fn render_throughput(frame: &mut Frame<'_>, history: &crate::metrics::MetricsHistory, area: Rect) {
-    use ratatui::{symbols::Marker, widgets::canvas::{Canvas, Points}};
-
-    frame.render_widget(Clear, area);
-
+fn render_spectrum(frame: &mut Frame<'_>, spectrum: &crate::spectrum::Spectrum, area: Rect) {
     let block = Block::default()
-        .title(Line::from(Span::styled(" agent throughput ", title_style())))
-        .borders(Borders::ALL);
+        .title(Line::from(Span::styled(" agent activity ", accent())))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    if inner.height == 0 || inner.width == 0 {
+    if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    // Split inner: one row for readout, rest for the braille canvas.
-    let split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-    let readout_area = split[0];
-    let canvas_area = split[1];
+    const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let w = inner.width as usize;
+    let h = inner.height as usize;
+    let heights = spectrum.heights();
+    let peaks = spectrum.peaks();
 
-    let series = history.throughput_series();
-    let cost_series = history.cost_series();
-    let latest = history.latest_global();
+    let mut lines: Vec<Line> = Vec::with_capacity(h);
+    for row in 0..h {
+        // Rows render top (row 0) to bottom; count cells up from the bottom.
+        let cell_from_bottom = (h - 1 - row) as i32;
+        let mut spans: Vec<Span> = Vec::with_capacity(w);
+        for col in 0..w {
+            let val = heights.get(col).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let peak = peaks.get(col).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let total_eighths = (val * h as f32 * 8.0).round() as i32;
+            let fill = (total_eighths - cell_from_bottom * 8).clamp(0, 8);
+            let peak_cell = ((peak * h as f32).ceil() as i32 - 1).max(0);
 
-    let (tok_s, cost_total, live) = latest
-        .map(|g| (g.tokens_per_sec, g.cost_total, g.live))
-        .unwrap_or((0.0, 0.0, 0));
-
-    let rate_str = throughput_burn_rate_hr(&cost_series)
-        .map(|r| format!("${r:.2}/hr"))
-        .unwrap_or_else(|| "-".to_string());
-
-    let readout = format!("▲ {tok_s:.0} tok/s · ${cost_total:.2} · {rate_str} · {live} live");
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            readout,
-            Style::default().fg(Color::Cyan),
-        ))),
-        readout_area,
-    );
-
-    if canvas_area.height == 0 || canvas_area.width == 0 || series.is_empty() {
-        return;
-    }
-
-    let max_val = series.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
-    let n = series.len();
-    let canvas_h = canvas_area.height;
-
-    frame.render_widget(
-        Canvas::default()
-            .marker(Marker::Braille)
-            .x_bounds([0.0, n as f64])
-            .y_bounds([0.0, max_val])
-            .paint(move |ctx| {
-                // Number of y-samples per column: match braille vertical resolution.
-                let steps = (canvas_h as usize * 4).max(1);
-                let mut cyan_pts: Vec<(f64, f64)> = Vec::new();
-                let mut green_pts: Vec<(f64, f64)> = Vec::new();
-                let mut hot_pts: Vec<(f64, f64)> = Vec::new();
-
-                for (i, &val) in series.iter().enumerate() {
-                    if val <= 0.0 {
-                        continue;
-                    }
-                    // x centred in each integer-width column bucket.
-                    let x = i as f64 + 0.5;
-                    let norm = val / max_val;
-
-                    for j in 0..=steps {
-                        let y = val * j as f64 / steps as f64;
-                        let pt = (x, y);
-                        if norm < 0.33 {
-                            cyan_pts.push(pt);
-                        } else if norm < 0.66 {
-                            green_pts.push(pt);
-                        } else {
-                            hot_pts.push(pt);
-                        }
-                    }
+            if fill == 0 {
+                if peak > 0.03 && cell_from_bottom == peak_cell {
+                    spans.push(Span::styled("▔", Style::default().fg(Color::Rgb(180, 220, 255))));
+                } else {
+                    spans.push(Span::raw(" "));
                 }
-
-                ctx.draw(&Points { coords: &cyan_pts, color: Color::Rgb(0, 200, 200) });
-                ctx.draw(&Points { coords: &green_pts, color: Color::Rgb(0, 200, 0) });
-                ctx.draw(&Points { coords: &hot_pts, color: Color::Rgb(220, 80, 0) });
-            }),
-        canvas_area,
-    );
+                continue;
+            }
+            let frac = (cell_from_bottom as f32 + 1.0) / h as f32;
+            spans.push(Span::styled(
+                BLOCKS[fill as usize].to_string(),
+                Style::default().fg(spectrum_level_color(frac)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-pub fn render_heat_ribbon(frame: &mut Frame<'_>, history: &crate::metrics::MetricsHistory, area: Rect) {
-    frame.render_widget(Clear, area);
-
-    let width = area.width as usize;
-    if width == 0 {
-        return;
-    }
-
-    let projects = history.projects();
-    if projects.is_empty() {
-        return;
-    }
-
-    let max_heat = projects
-        .iter()
-        .map(|p| p.tokens_per_min)
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-
-    let heat_glyph = "●";
-    let total = projects.len();
-
-    // Determine how many cells fit in `width`.
-    let mut used = 0usize;
-    let mut fit = 0usize;
-
-    for (i, project) in projects.iter().enumerate() {
-        let cell_w = project.project.chars().count() + heat_glyph.chars().count();
-        let sep_w = if i > 0 { 1 } else { 0 };
-        // If there are more cells after this one, reserve room for the "+N" suffix.
-        let remaining_after = total - i - 1;
-        let overflow_reserve = if remaining_after > 0 {
-            1 + format!("+{remaining_after}").len() // " +N"
-        } else {
-            0
-        };
-
-        if used + sep_w + cell_w + overflow_reserve > width {
-            break;
-        }
-
-        used += sep_w + cell_w;
-        fit += 1;
-    }
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-
-    for (i, project) in projects.iter().take(fit).enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let norm = if project.tokens_per_min <= 0.0 {
-            0.0
-        } else {
-            project.tokens_per_min / max_heat
-        };
-        let (fg, bg) = ribbon_heat_color(norm);
-        spans.push(Span::styled(
-            format!("{}{heat_glyph}", project.project),
-            Style::default().fg(fg).bg(bg),
-        ));
-    }
-
-    let overflow = total - fit;
-    if overflow > 0 {
-        if fit > 0 {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled(
-            format!("+{overflow}"),
-            dim(),
-        ));
-    }
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn ribbon_heat_color(norm: f64) -> (Color, Color) {
-    if norm <= 0.0 {
-        (Color::DarkGray, Color::Reset)
-    } else if norm < 0.33 {
-        (Color::White, Color::Rgb(20, 20, 60))
-    } else if norm < 0.66 {
-        (Color::White, Color::Rgb(60, 40, 0))
+fn spectrum_level_color(frac: f32) -> Color {
+    // Classic EQ gradient: green low, yellow mid, red peaks.
+    if frac < 0.5 {
+        Color::Rgb(40, 200, 90)
+    } else if frac < 0.78 {
+        Color::Rgb(225, 205, 60)
     } else {
-        (Color::White, Color::Rgb(100, 30, 0))
+        Color::Rgb(235, 75, 60)
     }
 }
 
-fn throughput_burn_rate_hr(cost_series: &[f64]) -> Option<f64> {
-    if cost_series.len() < 2 {
-        return None;
-    }
-    let first = *cost_series.first()?;
-    let last = *cost_series.last()?;
-    let delta = last - first;
-    if delta <= 0.0 {
-        return None;
-    }
-    // Samples are ~1 second apart; extrapolate to one hour.
-    let window_secs = (cost_series.len() - 1) as f64;
-    Some(delta / window_secs * 3600.0)
+/// Overall agent activity in 0..=1, driving the spectrum amplitude. Combines
+/// token throughput, live-agent CPU, and live count, with a small idle baseline
+/// so the spectrum always shimmers.
+fn spectrum_energy(history: &crate::metrics::MetricsHistory) -> f32 {
+    let global = history.latest_global();
+    let tps = global.map(|g| g.tokens_per_sec).unwrap_or(0.0) as f32;
+    let live = global.map(|g| g.live).unwrap_or(0) as f32;
+    let cpu = history.latest_cpu_total() as f32;
+
+    let tps_term = (tps / 350.0).min(1.0);
+    let cpu_term = (cpu / 110.0).min(1.0);
+    let live_term = (live / 3.0).min(1.0);
+    const BASELINE: f32 = 0.55;
+    (BASELINE + 0.45 * tps_term + 0.40 * cpu_term + 0.20 * live_term).min(1.0)
 }
 
 fn header(snapshot: &AmbientSnapshot, filter: SessionFilter) -> Paragraph<'static> {
@@ -1885,8 +1772,8 @@ mod tests {
 
     #[test]
     fn top_panel_toggles() {
-        assert_eq!(super::TopPanel::Throughput.next(), super::TopPanel::Swimlane);
-        assert_eq!(super::TopPanel::Swimlane.next(), super::TopPanel::Throughput);
+        assert_eq!(super::TopPanel::Spectrum.next(), super::TopPanel::Swimlane);
+        assert_eq!(super::TopPanel::Swimlane.next(), super::TopPanel::Spectrum);
     }
 
     #[test]
@@ -2080,26 +1967,14 @@ mod tests {
     }
 
     #[test]
-    fn heat_ribbon_lists_projects() {
+    fn spectrum_renders_without_panicking() {
         use ratatui::{backend::TestBackend, Terminal};
-        let mut h = crate::metrics::MetricsHistory::new(8);
-        h.push(&super::tests_support_snapshot(0));
-        h.push(&super::tests_support_snapshot(1));
-        let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
-        term.draw(|f| super::render_heat_ribbon(f, &h, f.area())).unwrap();
-        let content: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(content.contains("x"), "project name (cwd '/x' → repo 'x') present");
-    }
-
-    #[test]
-    fn throughput_renders_without_panicking() {
-        use ratatui::{backend::TestBackend, Terminal};
-        let mut h = crate::metrics::MetricsHistory::new(64);
-        for t in 0..30 {
-            h.push(&super::tests_support_snapshot(t));
+        let mut s = crate::spectrum::Spectrum::new(crate::spectrum::BARS);
+        for _ in 0..20 {
+            s.tick(0.8, 0.05);
         }
-        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
-        term.draw(|f| super::render_throughput(f, &h, f.area())).unwrap();
+        let mut term = Terminal::new(TestBackend::new(80, 9)).unwrap();
+        term.draw(|f| super::render_spectrum(f, &s, f.area())).unwrap();
         let content: String = term
             .backend()
             .buffer()
@@ -2107,7 +1982,15 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(content.contains("tok/s"), "readout present");
+        assert!(content.contains("agent activity"), "panel title present");
+    }
+
+    #[test]
+    fn spectrum_renders_at_tiny_size_without_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let s = crate::spectrum::Spectrum::new(crate::spectrum::BARS);
+        let mut term = Terminal::new(TestBackend::new(2, 2)).unwrap();
+        term.draw(|f| super::render_spectrum(f, &s, f.area())).unwrap();
     }
 
     // ── Stream view tests ────────────────────────────────────────────────────
