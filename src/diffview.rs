@@ -187,6 +187,40 @@ fn locate_base(path: &str, hunk: &FileEditHunk) -> usize {
     }
 }
 
+/// Syntax-highlight a single line of code into colored spans (foreground only,
+/// no background). `ext` is the file extension used to pick the grammar; unknown
+/// extensions fall back to plain text. Used to highlight code shown in tool
+/// results (e.g. a `Read` body) the same way diffs are highlighted.
+pub fn highlight_spans(text: &str, ext: &str) -> Vec<Span<'static>> {
+    let (syntaxes, theme) = assets();
+    let syntax = syntaxes
+        .find_syntax_by_extension(ext)
+        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let line_text = format!("{text}\n");
+    let mut spans = Vec::new();
+    if let Ok(ranges) = highlighter.highlight_line(&line_text, syntaxes) {
+        for (syn, piece) in ranges {
+            let piece = piece.trim_end_matches('\n');
+            if piece.is_empty() {
+                continue;
+            }
+            spans.push(Span::styled(
+                piece.to_string(),
+                Style::default().fg(Color::Rgb(
+                    syn.foreground.r,
+                    syn.foreground.g,
+                    syn.foreground.b,
+                )),
+            ));
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(text.to_string()));
+    }
+    spans
+}
+
 fn render_file_edit_uncached(path: &str, hunks: &[FileEditHunk], width: usize) -> Vec<Line<'static>> {
     let (syntaxes, theme) = assets();
     let syntax = syntaxes
@@ -310,6 +344,23 @@ mod tests {
 
     fn cache_len() -> usize {
         super::cache().lock().unwrap().len()
+    }
+
+    #[test]
+    fn highlight_spans_colors_rust_tokens() {
+        let spans = highlight_spans("pub fn main() {}", "rs");
+        let colors: std::collections::HashSet<(u8, u8, u8)> = spans
+            .iter()
+            .filter_map(|s| match s.style.fg {
+                Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            colors.len() >= 2,
+            "rust code should produce multiple token colors, got {}",
+            colors.len()
+        );
     }
 
     #[test]

@@ -1579,12 +1579,21 @@ fn feed_record_lines(record: &FeedRecord, width: usize) -> Vec<Line<'static>> {
                 ));
             }
             header.push(Span::styled("result", style));
+            // If this result is a code file (Read/Write/Edit body), highlight it.
+            let code_lang = record.annotations.iter().find_map(|a| match a {
+                Annotation::CodeLang(ext) => Some(ext.as_str()),
+                _ => None,
+            });
             let mut lines = vec![Line::from(header)];
             for line in detail.lines().take(10) {
-                lines.push(Line::from(vec![
-                    Span::styled("  │ ", dim()),
-                    Span::styled(truncate(line, width.saturating_sub(2)), style),
-                ]));
+                let truncated = truncate(line, width.saturating_sub(2));
+                let mut spans = vec![Span::styled("  │ ", dim())];
+                if *ok && let Some(ext) = code_lang {
+                    spans.extend(crate::diffview::highlight_spans(&truncated, ext));
+                } else {
+                    spans.push(Span::styled(truncated, style));
+                }
+                lines.push(Line::from(spans));
             }
             lines
         }
@@ -1628,6 +1637,8 @@ fn annotation_badges(annotations: &[Annotation]) -> Vec<Span<'static>> {
                 Span::raw(" "),
                 Span::styled(format!("cmd {}", truncate(command, 28)), dim()),
             ]),
+            // Carries the language for highlighting the result body; no badge.
+            Annotation::CodeLang(_) => {}
         }
     }
     spans

@@ -59,6 +59,9 @@ pub enum Annotation {
     TokenSpike { tokens: u64 },
     FileTouched(String),
     CommandRun(String),
+    /// File extension of the code a tool result is showing (e.g. a `Read` of a
+    /// `.rs` file), so the renderer can syntax-highlight the body.
+    CodeLang(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +132,46 @@ impl Highlighter {
     }
 }
 
+/// Scan one Claude journal line for `Read`/`Write`/`Edit`-family tool uses and
+/// record each tool-use id → file extension, so the matching result body can be
+/// highlighted. Only tools that carry a `file_path` are considered.
+fn collect_tool_langs(line: &str, map: &mut std::collections::HashMap<String, String>) {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let Some(blocks) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+        if !matches!(name, "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+            continue;
+        }
+        let (Some(id), Some(path)) = (
+            block.get("id").and_then(Value::as_str),
+            block
+                .get("input")
+                .and_then(|i| i.get("file_path"))
+                .and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if let Some((_, ext)) = path.rsplit_once('.')
+            && !ext.is_empty()
+            && ext.len() <= 8
+        {
+            map.insert(id.to_string(), ext.to_string());
+        }
+    }
+}
+
 pub fn load_session_feed(
     path: &Path,
     agent: AgentKind,
@@ -140,8 +183,14 @@ pub fn load_session_feed(
     let start = lines.len().saturating_sub(max_lines);
     let mut feed = SessionFeed::default();
     let mut highlighter = Highlighter::new();
+    // Map each Read/Write/Edit tool-use id to its file extension so the matching
+    // tool result (the file body) can be syntax-highlighted.
+    let mut id_lang: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     for line in lines.into_iter().skip(start) {
+        if agent == AgentKind::Claude {
+            collect_tool_langs(line, &mut id_lang);
+        }
         let parsed = match agent {
             AgentKind::Claude => parse_claude_line(line, session_id),
             AgentKind::Codex => parse_codex_line(line, session_id),
@@ -151,6 +200,11 @@ pub fn load_session_feed(
                 if !record.annotations.contains(&annotation) {
                     record.annotations.push(annotation);
                 }
+            }
+            if let FeedEvent::ToolResult { id, .. } = &record.event
+                && let Some(ext) = id_lang.get(id)
+            {
+                record.annotations.push(Annotation::CodeLang(ext.clone()));
             }
             match &record.event {
                 FeedEvent::Usage {
@@ -557,6 +611,7 @@ pub fn annotation_summary(annotations: &[Annotation]) -> String {
             Annotation::CommandRun(command) => {
                 parts.push(format!("cmd {}", truncate_summary(command, 24)))
             }
+            Annotation::CodeLang(_) => {}
         }
     }
     parts.join(" · ")
@@ -734,5 +789,52 @@ mod tests {
         let recs = tail_records(&path, crate::model::AgentKind::Claude, "s", 2);
         assert!(recs.len() <= 2, "respects cap, got {}", recs.len());
         assert!(!recs.is_empty(), "parsed something");
+    }
+
+    #[test]
+    fn read_result_is_tagged_with_its_file_language() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // A Read tool call of a .rs file...
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"model": "claude", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read",
+                     "input": {"file_path": "/x/foo.rs"}}
+                ]}
+            })
+        )
+        .unwrap();
+        // ...and its result carrying the file body.
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "pub fn main() {}"}
+                ]}
+            })
+        )
+        .unwrap();
+
+        let feed = load_session_feed(&path, crate::model::AgentKind::Claude, "s", 600).unwrap();
+        let result = feed
+            .records
+            .iter()
+            .find(|r| matches!(r.event, FeedEvent::ToolResult { .. }))
+            .expect("a tool result record");
+        assert!(
+            result
+                .annotations
+                .contains(&Annotation::CodeLang("rs".to_string())),
+            "Read result should be tagged with its language, got {:?}",
+            result.annotations
+        );
     }
 }
