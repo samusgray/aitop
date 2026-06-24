@@ -269,6 +269,16 @@ fn handle_key(
     stream_projects: &[String],
     last_stream_offset: usize,
 ) -> KeyAction {
+    // Resolve the "newest" sentinel and clamp a stale selection (e.g. after a
+    // filter shrank the list) so every Stream handler sees a valid index.
+    if let ViewMode::Stream { selected: sel, .. } = mode {
+        *sel = if stream_filtered_len > 0 {
+            (*sel).min(stream_filtered_len - 1)
+        } else {
+            0
+        };
+    }
+    let _ = last_stream_offset;
     match key {
         KeyCode::Char('q') => KeyAction::Quit,
         KeyCode::Esc => match mode {
@@ -287,7 +297,9 @@ fn handle_key(
         // 's' from Monitor opens Stream view.
         KeyCode::Char('s') if matches!(mode, ViewMode::Monitor) => {
             *mode = ViewMode::Stream {
-                selected: 0,
+                // usize::MAX is the "newest" sentinel; draw + normalize resolve it
+                // to the last event so the view opens on the freshest activity.
+                selected: usize::MAX,
                 scroll: 0,
                 follow: true,
                 expanded: BTreeSet::new(),
@@ -339,9 +351,10 @@ fn handle_key(
                 if !*follow {
                     *scroll = scroll.saturating_add(1);
                 }
-            } else if let ViewMode::Stream { selected: sel, .. } = mode {
+            } else if let ViewMode::Stream { selected: sel, follow, .. } = mode {
                 if stream_filtered_len > 0 {
                     *sel = sel.saturating_add(1).min(stream_filtered_len - 1);
+                    *follow = *sel == stream_filtered_len - 1;
                 }
             } else {
                 *selected = (*selected + 1).min(session_count.saturating_sub(1));
@@ -355,10 +368,7 @@ fn handle_key(
                 }
                 *follow = false;
                 *scroll = scroll.saturating_sub(1);
-            } else if let ViewMode::Stream { selected: sel, scroll, follow, .. } = mode {
-                if *follow {
-                    *scroll = last_stream_offset;
-                }
+            } else if let ViewMode::Stream { selected: sel, follow, .. } = mode {
                 *follow = false;
                 *sel = sel.saturating_sub(1);
             } else {
@@ -386,9 +396,11 @@ fn handle_key(
             if let ViewMode::Tail { scroll, follow } = mode {
                 *follow = false;
                 *scroll = scroll.saturating_add(5);
-            } else if let ViewMode::Stream { scroll, follow, .. } = mode {
-                *follow = false;
-                *scroll = scroll.saturating_add(5);
+            } else if let ViewMode::Stream { selected: sel, follow, .. } = mode
+                && stream_filtered_len > 0
+            {
+                *sel = sel.saturating_add(10).min(stream_filtered_len - 1);
+                *follow = *sel == stream_filtered_len - 1;
             }
             KeyAction::Continue
         }
@@ -399,12 +411,9 @@ fn handle_key(
                 }
                 *follow = false;
                 *scroll = scroll.saturating_sub(5);
-            } else if let ViewMode::Stream { scroll, follow, .. } = mode {
-                if *follow {
-                    *scroll = last_stream_offset;
-                }
+            } else if let ViewMode::Stream { selected: sel, follow, .. } = mode {
                 *follow = false;
-                *scroll = scroll.saturating_sub(5);
+                *sel = sel.saturating_sub(10);
             }
             KeyAction::Continue
         }
@@ -412,9 +421,8 @@ fn handle_key(
             if let ViewMode::Tail { scroll, follow } = mode {
                 *follow = false;
                 *scroll = 0;
-            } else if let ViewMode::Stream { follow, selected: sel, scroll, .. } = mode {
+            } else if let ViewMode::Stream { follow, selected: sel, .. } = mode {
                 *follow = false;
-                *scroll = 0;
                 *sel = 0;
             }
             KeyAction::Continue
@@ -423,8 +431,9 @@ fn handle_key(
             if let ViewMode::Tail { scroll, follow } = mode {
                 *follow = true;
                 *scroll = 0;
-            } else if let ViewMode::Stream { follow, .. } = mode {
+            } else if let ViewMode::Stream { follow, selected: sel, .. } = mode {
                 *follow = true;
+                *sel = usize::MAX;
             }
             KeyAction::Continue
         }
@@ -1141,7 +1150,7 @@ fn draw_stream(
     frame: &mut Frame<'_>,
     index: &crate::activity::ActivityIndex,
     selected: usize,
-    scroll: usize,
+    _scroll: usize,
     follow: bool,
     expanded: &BTreeSet<usize>,
     project_filter: &Option<String>,
@@ -1170,9 +1179,18 @@ fn draw_stream(
     let events =
         crate::activity::filter_events(index.events(), project_filter.as_deref(), errors_only);
     let n_events = events.len();
+    // Effective selection: `follow` pins to the newest event; otherwise resolve
+    // the sentinel / clamp to the last event.
+    let eff_sel = if follow {
+        n_events.saturating_sub(1)
+    } else {
+        selected.min(n_events.saturating_sub(1))
+    };
 
-    // Build all renderable lines (base row + optional detail rows).
+    // Build all renderable lines (base row + optional detail rows), recording the
+    // line index where each event's row starts so we can scroll it into view.
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut event_line_start: Vec<usize> = Vec::with_capacity(n_events);
 
     for (i, event) in events.iter().enumerate() {
         let time_str = event
@@ -1186,7 +1204,8 @@ fn draw_stream(
         let glyph = kind_glyph(&event.kind);
         let project_col = truncate(&event.project, 10);
         let summary_col = truncate(&event.summary, summary_width);
-        let is_selected = i == selected;
+        let is_selected = i == eff_sel;
+        event_line_start.push(lines.len());
 
         let base = if is_selected {
             // Selected row: full reverse video.
@@ -1245,9 +1264,11 @@ fn draw_stream(
         )));
     }
 
-    // Compute scroll offset and store for key-handler seed.
+    // Scroll so the selected event's row stays visible (or pin to the bottom
+    // when following the newest event).
     let viewport = body.height as usize;
-    let offset = feed_scroll_offset(follow, scroll, lines.len(), viewport);
+    let sel_line = event_line_start.get(eff_sel).copied().unwrap_or(0);
+    let offset = stream_offset(follow, sel_line, lines.len(), viewport);
     last_stream_scroll.set(offset);
 
     // Render body: skip to offset, take viewport rows.
@@ -1359,6 +1380,18 @@ fn feed_scroll_offset(follow: bool, manual_scroll: usize, total_lines: usize, vi
         max_start
     } else {
         manual_scroll.min(max_start)
+    }
+}
+
+/// Scroll offset for the activity stream: pin to the bottom while following the
+/// newest event, otherwise place the selected event's row about a third from the
+/// top so it (and some context) is always visible.
+fn stream_offset(follow: bool, sel_line: usize, total_lines: usize, viewport: usize) -> usize {
+    let max_start = total_lines.saturating_sub(viewport);
+    if follow {
+        max_start
+    } else {
+        sel_line.saturating_sub(viewport / 3).min(max_start)
     }
 }
 
@@ -1937,6 +1970,18 @@ mod tests {
     }
 
     #[test]
+    fn stream_offset_keeps_selection_visible() {
+        // Following → pinned to the bottom.
+        assert_eq!(super::stream_offset(true, 0, 100, 20), 80);
+        // Selected near the top → no scroll.
+        assert_eq!(super::stream_offset(false, 2, 100, 30), 0);
+        // Selected in the middle → ~1/3 from the top.
+        assert_eq!(super::stream_offset(false, 50, 100, 30), 40);
+        // Selected near the bottom → clamped to the last page.
+        assert_eq!(super::stream_offset(false, 99, 100, 30), 70);
+    }
+
+    #[test]
     fn manual_scroll_is_clamped_to_max_start() {
         // Can't scroll past total - viewport.
         assert_eq!(super::feed_scroll_offset(false, 999, 100, 20), 80);
@@ -2089,13 +2134,13 @@ mod tests {
         };
         let mut selected = 0usize;
         let mut filter = SessionFilter::Active;
-        // Enter inserts index 1
-        hk(&mut mode, &mut selected, &mut filter, 0, 0, KeyCode::Enter);
+        // Enter inserts index 1 (3 events, so the selection 1 is preserved).
+        handle_key(&mut mode, &mut selected, &mut filter, 0, 0, KeyCode::Enter, 3, &[], 0);
         if let ViewMode::Stream { ref expanded, .. } = mode {
             assert!(expanded.contains(&1));
         }
         // Enter again removes it
-        hk(&mut mode, &mut selected, &mut filter, 0, 0, KeyCode::Enter);
+        handle_key(&mut mode, &mut selected, &mut filter, 0, 0, KeyCode::Enter, 3, &[], 0);
         if let ViewMode::Stream { ref expanded, .. } = mode {
             assert!(!expanded.contains(&1));
         }
@@ -2169,7 +2214,7 @@ mod tests {
         let mut selected = 0usize;
         let mut filter = SessionFilter::Active;
         hk(&mut mode, &mut selected, &mut filter, 0, 0, KeyCode::Char('g'));
-        assert!(matches!(mode, ViewMode::Stream { selected: 0, follow: false, scroll: 0, .. }));
+        assert!(matches!(mode, ViewMode::Stream { selected: 0, follow: false, .. }));
     }
 
     #[test]
